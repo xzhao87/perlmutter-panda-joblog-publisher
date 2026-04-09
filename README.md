@@ -52,18 +52,18 @@ These complement each other:
 
 ## Installation
 
-### 1. Configure paths in config file
-Edit `publish_slurm_logs_config.json` and verify:
-- `paths.workdir_root` points to your harvester workdir
-- `paths.cfs_destination` points to your CFS www directory
-- `paths.split_script` points to split_slurm_output.py
-
-### 2. Create web visible directories on NERSC CFS 
+### 1. Create web visible directories on NERSC CFS 
 
 Refer to the NERSC doc at :
 https://docs.nersc.gov/services/science-gateways/#how-to-publish-your-data-on-ngf-to-the-web
 
 Note you only need to create the top directory, queue subdirectories (and all its subdirs) will be created automatically by the publisher.
+
+### 2. Configure paths in config file
+Edit `publish_slurm_logs_config.json` and verify:
+- `paths.workdir_root` points to your harvester workdir
+- `paths.cfs_destination` points to your CFS www directory
+- `paths.split_script` points to split_slurm_output.py
 
 ### 3. Test with dry-run
 ```bash
