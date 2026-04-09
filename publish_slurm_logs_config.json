@@ -1,0 +1,27 @@
+{
+    "description": "Configuration for automated SLURM log publishing to CFS",
+    
+    "paths": {
+        "workdir_root": "<pathname to the harvester workdir, right above the panda queue sub-directories>",
+        "cfs_destination": "<pathname to the CFS directory, where panda queue sub-directories will be auto-created underneath>",
+        "state_file": "<where do you want the .slurm_publish_state.json to be placed>",
+        "log_file": "<pathname of the publisher log file>"
+    },
+    
+    "timing": {
+        "scan_frequency_minutes": 10,
+        "retention_days": 5
+    },
+    
+    "processing": {
+        "split_script": "<pathname to the split_slurm_output.py script>",
+        "max_concurrent_jobs": 5,
+        "delete_original_splits": true
+    },
+    
+    "filters": {
+        "ignore_queues": [],
+        "only_completed_jobs": true,
+        "min_job_age_seconds": 300
+    }
+}

@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""
+Split SLURM Job Output Files by Task ID
+
+This script splits a large SLURM job output file (slurm-<jobid>.out) into separate
+files for each task. The SLURM output file contains interleaved output from multiple
+tasks running in parallel, with each line prefixed by the task ID.
+
+The script:
+1. Reads the slurm-<jobid>.out file
+2. Separates output lines by task ID (format: "taskid: log line")
+3. Attempts to extract PandaID from each task's logs
+4. Creates individual output files named:
+   - slurm-<jobid>-task<taskid>-panda<pandaid>.out (if PandaID is found)
+   - slurm-<jobid>-task<taskid>.out (if PandaID is not found)
+5. Keeps the original slurm-<jobid>.out file intact
+
+Usage:
+    python3 split_slurm_output.py <path_to_slurm_output_file>
+
+The script will create files in the same directory as the input file:
+    - slurm-<slurm job id>-task<task id>-panda<pandaID>.out
+    - etc.
+"""
+
+import sys
+import os
+import re
+from collections import defaultdict
+from pathlib import Path
+
+
+def extract_panda_id(lines):
+    """
+    Extract PandaID from task logs.
+    
+    Searches for patterns like:
+    - 'PandaID': '118014'
+    - "PandaID": "118014"
+    - received job: 118014
+    
+    Args:
+        lines: List of log lines for a specific task
+    
+    Returns:
+        PandaID as string if found, None otherwise
+    """
+    # Pattern 1: 'PandaID': '118014' or "PandaID": "118014"
+    panda_id_pattern1 = re.compile(r"['\"]PandaID['\"]:\s*['\"](\d+)['\"]")
+    
+    # Pattern 2: received job: 118014
+    panda_id_pattern2 = re.compile(r"received\s+job:\s+(\d+)")
+    
+    # Pattern 3: PandaID=118014 (from URL-encoded strings)
+    panda_id_pattern3 = re.compile(r"PandaID=(\d+)")
+    
+    for line in lines:
+        # Try all patterns
+        match = panda_id_pattern1.search(line)
+        if match:
+            return match.group(1)
+        
+        match = panda_id_pattern2.search(line)
+        if match:
+            return match.group(1)
+        
+        match = panda_id_pattern3.search(line)
+        if match:
+            return match.group(1)
+    
+    return None
+
+
+def split_slurm_output(slurm_file_path):
+    """
+    Split SLURM output file by task ID.
+    
+    Args:
+        slurm_file_path: Path to the slurm-<jobid>.out file
+    """
+    # Validate input file
+    if not os.path.exists(slurm_file_path):
+        print(f"Error: File not found: {slurm_file_path}", file=sys.stderr)
+        return 1
+    
+    # Extract SLURM job ID from filename
+    filename = os.path.basename(slurm_file_path)
+    slurm_job_id_match = re.match(r"slurm-(\d+)\.out", filename)
+    if not slurm_job_id_match:
+        print(f"Error: Invalid filename format. Expected slurm-<jobid>.out, got: {filename}", 
+              file=sys.stderr)
+        return 1
+    
+    slurm_job_id = slurm_job_id_match.group(1)
+    output_dir = os.path.dirname(os.path.abspath(slurm_file_path))
+    
+    print(f"Processing SLURM job {slurm_job_id} from {slurm_file_path}")
+    print(f"Output directory: {output_dir}")
+    
+    # Dictionary to store lines for each task
+    # Format: {task_id: [line1, line2, ...]}
+    task_lines = defaultdict(list)
+    
+    # Lines that don't have task prefix (header/footer lines)
+    untagged_lines = []
+    
+    # Pattern to match lines with task prefix: "taskid: log line"
+    # Note: SLURM output may have leading whitespace before task ID
+    # Format can be " 67: log line" or "67: log line"
+    task_line_pattern = re.compile(r"^\s*(\d+):\s*(.*)")
+    
+    # Read and parse the SLURM output file
+    print("Reading and parsing SLURM output file...")
+    line_count = 0
+    with open(slurm_file_path, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line_count += 1
+            if line_count % 10000 == 0:
+                print(f"  Processed {line_count} lines...")
+            
+            match = task_line_pattern.match(line)
+            if match:
+                task_id = int(match.group(1))
+                log_content = match.group(2)
+                task_lines[task_id].append(log_content + '\n')
+            else:
+                # Lines without task prefix (usually header/footer)
+                untagged_lines.append(line)
+    
+    print(f"Total lines processed: {line_count}")
+    print(f"Found {len(task_lines)} tasks")
+    print(f"Untagged lines: {len(untagged_lines)}")
+    
+    # Extract PandaID for each task and write output files
+    print("\nCreating individual task output files...")
+    created_files = []
+    
+    for task_id in sorted(task_lines.keys()):
+        lines = task_lines[task_id]
+        panda_id = extract_panda_id(lines)
+        
+        # Construct output filename
+        if panda_id:
+            output_filename = f"slurm-{slurm_job_id}-task{task_id}-panda{panda_id}.out"
+        else:
+            output_filename = f"slurm-{slurm_job_id}-task{task_id}.out"
+        
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # Write task output to file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        
+        created_files.append(output_filename)
+        panda_info = f" (PandaID: {panda_id})" if panda_id else " (PandaID not found)"
+        print(f"  Task {task_id:3d}: {output_filename:50s} - {len(lines):6d} lines{panda_info}")
+    
+    # Optionally write untagged lines to a separate file
+    if untagged_lines:
+        header_filename = f"slurm-{slurm_job_id}-header.out"
+        header_path = os.path.join(output_dir, header_filename)
+        with open(header_path, 'w', encoding='utf-8') as f:
+            f.writelines(untagged_lines)
+        print(f"\n  Header/untagged lines: {header_filename} - {len(untagged_lines)} lines")
+        created_files.append(header_filename)
+    
+    print(f"\nSuccessfully created {len(created_files)} output files")
+    print(f"Original file {filename} remains intact")
+    
+    return 0
+
+
+def main():
+    """Main entry point for the script."""
+    if len(sys.argv) != 2:
+        print(__doc__)
+        print("\nError: Missing required argument", file=sys.stderr)
+        print("\nUsage: python3 split_slurm_output.py <path_to_slurm_output_file>", 
+              file=sys.stderr)
+        return 1
+    
+    slurm_file_path = sys.argv[1]
+    return split_slurm_output(slurm_file_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
