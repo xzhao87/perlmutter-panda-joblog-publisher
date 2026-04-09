@@ -70,4 +70,15 @@ Note you only need to create the top directory, queue subdirectories (and all it
 python3 publish_slurm_logs.py --dry-run
 ```
 
-
+### 4. create a scronjob using the wrapper script run_slurm_publisher.sh, e.g.
+```
+#SCRON -C cron
+#SCRON -q workflow
+#SCRON -A m3763
+#SCRON -t 1:00:00
+#SCRON --dependency=singleton
+#SCRON -o <harvester install dir>/harvester/publish-slurm-logs/scron-output-%j.out
+#SCRON --job-name=slurm-publisher
+#SCRON --open-mode=truncate
+*/10 * * * * /<harvester install dir>/publish-slurm-logs/run_slurm_publisher.sh
+```
