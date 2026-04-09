@@ -9,7 +9,6 @@
     },
     
     "timing": {
-        "scan_frequency_minutes": 10,
         "retention_days": 5
     },
     
