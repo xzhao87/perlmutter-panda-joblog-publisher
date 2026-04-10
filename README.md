@@ -17,7 +17,7 @@ This system automatically:
 For each successfully completed task, the publisher copies:
 - **SLURM split output**: Infrastructure/wrapper/pilot logs from SLURM stdout/stderr
 - **pilotlog.txt**: Complete pilot logs including payload stdout/stderr and errors
-- **slurm-<slurmid>-header.out**: other info about the slurm job itself, e.g. executable, slurm level errors (if any)
+- **slurm-&lt;slurmid&gt;-header.out**: other info about the slurm job itself, e.g. executable, slurm level errors (if any)
 
 ## Components
 
