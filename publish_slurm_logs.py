@@ -6,11 +6,18 @@ This script scans for finished SLURM jobs, splits their output by task/PandaID,
 and publishes them to CFS for web access via NERSC Science Gateway.
 
 File structure in CFS:
-  $CFS/www/panda/workers/<queue_name>/<date>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
-  $CFS/www/panda/workers/<queue_name>/<date>/slurm-<jobid>-header.out
+  $CFS/www/panda/workers/<queue_name>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
+  $CFS/www/panda/workers/<queue_name>/slurm-<jobid>-header.out
 
 Usage:
   python3 publish_slurm_logs.py [--config CONFIG_FILE] [--dry-run]
+
+Recent Fixes:
+  2026-04-09: Removed date directory layer to avoid race condition between pilot and publisher
+  2026-04-09: Updated cleanup to use PandaID directory mtime instead of date parsing
+  2026-04-06: Fixed cleanup function to iterate through queue subdirectories
+  2026-04-02: Fixed file permissions to 0o644 for web accessibility
+  2026-04-02: Fixed job detection to handle random glob ordering
 """
 
 import os
@@ -203,27 +210,16 @@ class SlurmLogPublisher:
         Publish split files and pilotlog.txt to CFS in organized structure.
         
         Structure:
-          <queue_name>/<date>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
-          <queue_name>/<date>/<panda_id>/pilotlog.txt
-          <queue_name>/<date>/slurm-<jobid>-header.out
+          <queue_name>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
+          <queue_name>/<panda_id>/pilotlog.txt
+          <queue_name>/slurm-<jobid>-header.out
         
         Task 19: Only publish files from tasks that have PandaIDs.
         If NO tasks have PandaIDs, skip the entire job.
         If SOME tasks have PandaIDs, publish only those + header.
         """
         cfs_root = self.config['paths']['cfs_destination']
-        # Use SLURM output file creation date (when job actually ran)
-        slurm_file = os.path.join(worker_dir, f'slurm-{job_id}.out')
-        if os.path.exists(slurm_file):
-            slurm_mtime = os.path.getmtime(slurm_file)
-            job_date = datetime.fromtimestamp(slurm_mtime).strftime('%Y-%m-%d')
-        else:
-            # Fallback to worker directory mtime if SLURM file doesn't exist
-            self.logger.warning(f"SLURM file not found for date: {slurm_file}, using worker dir mtime")
-            worker_mtime = os.path.getmtime(worker_dir)
-            job_date = datetime.fromtimestamp(worker_mtime).strftime('%Y-%m-%d')
         queue_dir = os.path.join(cfs_root, queue_name)
-        date_dir = os.path.join(queue_dir, job_date)
         
         # Separate task files from header files
         task_files = []
@@ -275,17 +271,17 @@ class SlurmLogPublisher:
             
             # Determine destination
             if '-header.out' in filename:
-                # Header files go in date directory
-                dest_path = os.path.join(date_dir, filename)
+                # Header files go in queue directory
+                dest_path = os.path.join(queue_dir, filename)
             else:
-                # Task files go in <date>/<panda_id>/
+                # Task files go in <queue>/<panda_id>/
                 panda_id = self._extract_panda_id(filename)
                 if not panda_id:
                     # Should not happen since we filtered above, but safety check
                     self.logger.warning(f"No PandaID found in {filename}, skipping")
                     continue
                 
-                panda_dir = os.path.join(date_dir, panda_id)
+                panda_dir = os.path.join(queue_dir, panda_id)
                 dest_path = os.path.join(panda_dir, filename)
             
             # Publish file
@@ -316,7 +312,7 @@ class SlurmLogPublisher:
             pilotlog_source = os.path.join(worker_dir, job_id, task_id, 'pilotlog.txt')
             
             if os.path.exists(pilotlog_source):
-                panda_dir = os.path.join(date_dir, panda_id)
+                panda_dir = os.path.join(queue_dir, panda_id)
                 pilotlog_dest = os.path.join(panda_dir, 'pilotlog.txt')
                 
                 if dry_run:
@@ -336,16 +332,16 @@ class SlurmLogPublisher:
                 self.logger.debug(f"pilotlog.txt not found for task {task_id}: {pilotlog_source}")
         
         self.logger.info(
-            f"Published {published_count}/{len(files_to_publish)} files + {pilotlog_count} pilotlog.txt to {date_dir} "
+            f"Published {published_count}/{len(files_to_publish)} files + {pilotlog_count} pilotlog.txt to {queue_dir} "
             f"({len(files_with_panda_id)} task files, {len(header_files)} header files, {pilotlog_count} pilotlogs)"
         )
         return published_count + pilotlog_count
     
     def _cleanup_old_directories(self, dry_run=False):
-        """Remove date directories older than retention_days within each queue"""
+        """Remove PandaID directories older than retention_days within each queue"""
         cfs_root = self.config['paths']['cfs_destination']
         retention_days = self.config['timing']['retention_days']
-        cutoff_date = datetime.now() - timedelta(days=retention_days)
+        cutoff_time = (datetime.now() - timedelta(days=retention_days)).timestamp()
         
         if not os.path.exists(cfs_root):
             return
@@ -358,24 +354,28 @@ class SlurmLogPublisher:
             if not os.path.isdir(queue_path):
                 continue
             
-            # Within each queue, look for date directories
-            for date_dir_name in os.listdir(queue_path):
-                date_dir_path = os.path.join(queue_path, date_dir_name)
-                if not os.path.isdir(date_dir_path):
+            # Within each queue, look for PandaID directories
+            for panda_dir_name in os.listdir(queue_path):
+                panda_dir_path = os.path.join(queue_path, panda_dir_name)
+                if not os.path.isdir(panda_dir_path):
                     continue
                 
-                # Check if it's a date directory
+                # Skip header files and non-numeric directories
+                if not panda_dir_name.isdigit():
+                    continue
+                
+                # Check directory mtime (last modification time)
                 try:
-                    dir_date = datetime.strptime(date_dir_name, '%Y-%m-%d')
-                    if dir_date < cutoff_date:
+                    dir_mtime = os.path.getmtime(panda_dir_path)
+                    if dir_mtime < cutoff_time:
                         if dry_run:
-                            self.logger.info(f"[DRY-RUN] Would remove old directory: {date_dir_path}")
+                            self.logger.info(f"[DRY-RUN] Would remove old directory: {panda_dir_path}")
                         else:
-                            shutil.rmtree(date_dir_path)
-                            self.logger.info(f"Removed old directory: {queue_name}/{date_dir_name}")
+                            shutil.rmtree(panda_dir_path)
+                            self.logger.info(f"Removed old directory: {queue_name}/{panda_dir_name}")
                             removed_count += 1
-                except ValueError:
-                    # Not a date directory, skip
+                except OSError as e:
+                    self.logger.warning(f"Could not check/remove {panda_dir_path}: {e}")
                     continue
         
         if removed_count > 0:
@@ -500,7 +500,7 @@ def main():
     )
     parser.add_argument(
         '--config',
-        default='./publish_slurm_logs_config.json',
+        default='/global/homes/x/xin/ws-panda/slurm-jobs/publish_slurm_logs_config.json',
         help='Path to configuration file'
     )
     parser.add_argument(

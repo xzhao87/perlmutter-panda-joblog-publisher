@@ -40,7 +40,7 @@ These complement each other:
 - **Features**:
   - Checks if SLURM jobs are finished (not in queue, old enough)
   - Splits SLURM output using split_slurm_output.py
-  - Organizes files by job execution date (from SLURM file mtime) and PandaID
+  - Organizes files by panda queues and panda job PandaID
   - Sets world-readable permissions (0o644) for web access
   - Maintains state to avoid re-processing
   - Automatic cleanup of old directories
@@ -99,4 +99,4 @@ srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG ...
 echo "export GTAG="$GTAG >> myEnv.sh
 ```
 
-### 3. in pilot nersc plugin, change the get_pilot_id function to get the pilot id from the environment variable GTAG and append date/PandaID for direct log access.
+### 3. in pilot nersc plugin, change the get_pilot_id function to get the pilot id from the environment variable GTAG and append <PandaID> for direct log access.
