@@ -14,13 +14,11 @@
     
     "processing": {
         "split_script": "<pathname to the split_slurm_output.py script>",
-        "max_concurrent_jobs": 5,
         "delete_original_splits": true
     },
     
     "filters": {
         "ignore_queues": [],
-        "only_completed_jobs": true,
         "min_job_age_seconds": 300
     }
 }
