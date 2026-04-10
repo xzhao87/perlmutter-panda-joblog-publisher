@@ -30,7 +30,6 @@ These complement each other:
 - **Key settings**:
   - `paths.workdir_root`: Where harvester places worker directories
   - `paths.cfs_destination`: CFS directory for published logs
-  - `timing.scan_frequency_minutes`: How often to scan (for documentation)
   - `timing.retention_days`: How long to keep published logs
   - `processing.split_script`: Path to split_slurm_output.py
 
