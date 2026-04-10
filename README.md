@@ -1,6 +1,6 @@
 # perlmutter-panda-joblog-publisher
 
-This repo contains scripts for publishing SLURM job logs to CFS (NERSC Science Gateway) in a PanDA-centric directory structure.
+This repo contains scripts for publishing NERSC perlmutter SLURM job logs to NERSC CFS web directory. 
 
 ## Overview
 
