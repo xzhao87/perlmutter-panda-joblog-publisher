@@ -18,6 +18,7 @@ For each successfully completed task, the publisher copies:
 - **SLURM split output**: Infrastructure/wrapper/pilot logs from SLURM stdout/stderr
 - **pilotlog.txt**: Complete pilot logs including payload stdout/stderr and errors
 - **slurm-&lt;slurmid&gt;-header.out**: other info about the slurm job itself, e.g. executable, slurm level errors (if any)
+- **additional files for failed tasks**: configurable in the configuration file (see below)
 
 ## Components
 
@@ -29,6 +30,7 @@ For each successfully completed task, the publisher copies:
   - `paths.cfs_destination`: CFS directory for published logs
   - `timing.retention_days`: How long to keep published logs
   - `processing.split_script`: Path to split_slurm_output.py
+  - `additional_files_for_failed_tasks`: list of files to be copied to CFS for failed tasks (i.e. pilots), defined by users. 
 
 ### Main Script
 - **File**: `publish_slurm_logs.py`

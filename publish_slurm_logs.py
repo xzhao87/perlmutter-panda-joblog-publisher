@@ -14,6 +14,7 @@ Usage:
   python3 publish_slurm_logs.py [--config CONFIG_FILE] [--dry-run]
 
 Recent Fixes:
+  2026-04-10: Added support for copying additional files from failed tasks (Task 28)
   2026-04-10: Changed header files to be copied to each PandaID directory 
   2026-04-09: Removed date directory layer to avoid race condition between pilot and publisher
   2026-04-09: Updated cleanup to use PandaID directory mtime instead of date parsing
@@ -207,6 +208,103 @@ class SlurmLogPublisher:
         match = re.search(r'^slurm-(\d+)-', filename)
         return match.group(1) if match else None
     
+    def _is_failed_task(self, task_dir):
+        """
+        Check if a task is a failed/incomplete task.
+        A task is considered failed if it contains a PanDA_Pilot-* subdirectory.
+        
+        Returns: (is_failed, pilot_dir_path)
+        """
+        if not os.path.isdir(task_dir):
+            return False, None
+        
+        # Look for PanDA_Pilot-* directories
+        try:
+            for item in os.listdir(task_dir):
+                item_path = os.path.join(task_dir, item)
+                if os.path.isdir(item_path) and item.startswith('PanDA_Pilot-'):
+                    return True, item_path
+        except OSError as e:
+            self.logger.warning(f"Could not check for failed task in {task_dir}: {e}")
+        
+        return False, None
+    
+    def _copy_additional_files_for_failed_task(self, task_dir, panda_id, queue_dir, dry_run=False):
+        """
+        Copy additional files from failed tasks to CFS.
+        
+        Task 28: For failed tasks (containing PanDA_Pilot-* subdirectory), copy
+        additional files as specified in config's additional_files_for_failed_tasks.
+        
+        Returns: number of files copied
+        """
+        is_failed, pilot_dir = self._is_failed_task(task_dir)
+        if not is_failed:
+            return 0
+        
+        # Get config for additional files
+        additional_files_config = self.config.get('additional_files_for_failed_tasks', [])
+        if not additional_files_config:
+            return 0
+        
+        self.logger.info(f"Task {task_dir} is a failed task, copying additional files...")
+        
+        panda_dir = os.path.join(queue_dir, panda_id)
+        copied_count = 0
+        
+        # Process each configured file pattern
+        for file_spec in additional_files_config:
+            src_dir_pattern = file_spec.get('src_dir', '')
+            files_pattern = file_spec.get('files', '')
+            
+            if not src_dir_pattern or not files_pattern:
+                continue
+            
+            # Find matching source directories using glob
+            src_dir_glob = os.path.join(task_dir, src_dir_pattern)
+            matching_dirs = list(Path(task_dir).glob(src_dir_pattern))
+            
+            for src_dir in matching_dirs:
+                if not src_dir.is_dir():
+                    continue
+                
+                # For each file pattern (comma-separated)
+                file_patterns = [p.strip() for p in files_pattern.split(',')]
+                
+                for file_pattern in file_patterns:
+                    # Find matching files
+                    matching_files = list(src_dir.glob(file_pattern))
+                    
+                    for src_file in matching_files:
+                        if not src_file.is_file():
+                            continue
+                        
+                        # Calculate relative path from task_dir to maintain structure
+                        try:
+                            rel_path = src_file.relative_to(task_dir)
+                            dest_file = os.path.join(panda_dir, rel_path)
+                            dest_dir = os.path.dirname(dest_file)
+                            
+                            if dry_run:
+                                self.logger.info(f"[DRY-RUN] Would copy failed task file: {src_file} -> {dest_file}")
+                                copied_count += 1
+                            else:
+                                try:
+                                    os.makedirs(dest_dir, exist_ok=True)
+                                    shutil.copy2(src_file, dest_file)
+                                    os.chmod(dest_file, 0o644)
+                                    self.logger.debug(f"Copied failed task file: {rel_path}")
+                                    copied_count += 1
+                                except Exception as e:
+                                    self.logger.warning(f"Failed to copy {src_file}: {e}")
+                        except ValueError as e:
+                            self.logger.warning(f"Could not compute relative path for {src_file}: {e}")
+        
+        if copied_count > 0:
+            self.logger.info(f"Copied {copied_count} additional files from failed task {task_dir}")
+        
+        return copied_count
+    
     def _publish_files(self, split_files, queue_name, worker_dir, job_id, dry_run=False):
         """
         Publish split files and pilotlog.txt to CFS in organized structure.
@@ -355,11 +453,30 @@ class SlurmLogPublisher:
             else:
                 self.logger.debug(f"pilotlog.txt not found for task {task_id}: {pilotlog_source}")
         
+        # Task 28: Copy additional files from failed tasks
+        failed_task_files_count = 0
+        for split_file in files_with_panda_id:
+            filename = os.path.basename(split_file)
+            panda_id = self._extract_panda_id(filename)
+            task_id = self._extract_task_id(filename)
+            
+            if not panda_id or not task_id:
+                continue
+            
+            # Check if this task is a failed task and copy additional files
+            task_dir = os.path.join(worker_dir, job_id, task_id)
+            if os.path.isdir(task_dir):
+                copied = self._copy_additional_files_for_failed_task(
+                    task_dir, panda_id, queue_dir, dry_run=dry_run
+                )
+                failed_task_files_count += copied
+        
         self.logger.info(
-            f"Published {published_count} task files + {header_count} header copies + {pilotlog_count} pilotlogs to {queue_dir} "
+            f"Published {published_count} task files + {header_count} header copies + "
+            f"{pilotlog_count} pilotlogs + {failed_task_files_count} failed task files to {queue_dir} "
             f"({len(unique_panda_ids)} unique PandaIDs)"
         )
-        return published_count + header_count + pilotlog_count
+        return published_count + header_count + pilotlog_count + failed_task_files_count
     
     def _cleanup_old_directories(self, dry_run=False):
         """Remove PandaID directories older than retention_days within each queue"""

@@ -20,5 +20,18 @@
     "filters": {
         "ignore_queues": [],
         "min_job_age_seconds": 300
-    }
+    },
+
+    "additional_files_for_failed_tasks": [
+        {
+            "comment": "Payload stdout/stderr from PanDA_Pilot-* directory",
+            "src_dir": "PanDA_Pilot-*",
+            "files": "payload.stdout,payload.stderr,preprocess*.txt"
+        },
+        {
+            "comment": "CSV output files from workDir subdirectory",
+            "src_dir": "PanDA_Pilot-*/workDir",
+            "files": "dataprod_rel*.csv,test*.csv"
+        }
+    ]    
 }
