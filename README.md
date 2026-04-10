@@ -17,10 +17,7 @@ This system automatically:
 For each successfully completed task, the publisher copies:
 - **SLURM split output**: Infrastructure/wrapper/pilot logs from SLURM stdout/stderr
 - **pilotlog.txt**: Complete pilot logs including payload stdout/stderr and errors
-
-These complement each other:
-- SLURM output: Best for debugging wrapper scripts, environment setup, SLURM issues
-- pilotlog.txt: Best for debugging payload failures, application errors 
+- **slurm-<slurmid>-header.out**: other info about the slurm job itself, e.g. executable, slurm level errors (if any)
 
 ## Components
 
@@ -73,7 +70,7 @@ python3 publish_slurm_logs.py --dry-run
 ```
 #SCRON -C cron
 #SCRON -q workflow
-#SCRON -A m3763
+#SCRON -A <project name>
 #SCRON -t 1:00:00
 #SCRON --dependency=singleton
 #SCRON -o <harvester install dir>/harvester/publish-slurm-logs/scron-output-%j.out
@@ -98,4 +95,4 @@ srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG ...
 echo "export GTAG="$GTAG >> myEnv.sh
 ```
 
-### 3. in pilot nersc plugin, change the get_pilot_id function to get the pilot id from the environment variable GTAG and append <PandaID> for direct log access.
+### 3. in pilot nersc plugin, change the get_pilot_id function to construct the pilot_id as "$GTAG/<PandaID>".

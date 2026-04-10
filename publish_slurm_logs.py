@@ -7,12 +7,14 @@ and publishes them to CFS for web access via NERSC Science Gateway.
 
 File structure in CFS:
   $CFS/www/panda/workers/<queue_name>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
-  $CFS/www/panda/workers/<queue_name>/slurm-<jobid>-header.out
+  $CFS/www/panda/workers/<queue_name>/<panda_id>/slurm-<jobid>-header.out
+  $CFS/www/panda/workers/<queue_name>/<panda_id>/pilotlog.txt
 
 Usage:
   python3 publish_slurm_logs.py [--config CONFIG_FILE] [--dry-run]
 
 Recent Fixes:
+  2026-04-10: Changed header files to be copied to each PandaID directory 
   2026-04-09: Removed date directory layer to avoid race condition between pilot and publisher
   2026-04-09: Updated cleanup to use PandaID directory mtime instead of date parsing
   2026-04-06: Fixed cleanup function to iterate through queue subdirectories
@@ -211,12 +213,13 @@ class SlurmLogPublisher:
         
         Structure:
           <queue_name>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
+          <queue_name>/<panda_id>/slurm-<jobid>-header.out
           <queue_name>/<panda_id>/pilotlog.txt
-          <queue_name>/slurm-<jobid>-header.out
         
         Task 19: Only publish files from tasks that have PandaIDs.
+        Task 26: Copy header file to each PandaID directory.
         If NO tasks have PandaIDs, skip the entire job.
-        If SOME tasks have PandaIDs, publish only those + header.
+        If SOME tasks have PandaIDs, publish only those + header to each PandaID dir.
         """
         cfs_root = self.config['paths']['cfs_destination']
         queue_dir = os.path.join(cfs_root, queue_name)
@@ -261,28 +264,26 @@ class SlurmLogPublisher:
                 f"Publishing only tasks with PandaIDs."
             )
         
-        # Publish files with PandaIDs and header files
-        published_count = 0
-        pilotlog_count = 0
-        files_to_publish = files_with_panda_id + header_files
-        
-        for split_file in files_to_publish:
+        # Collect unique PandaIDs for header file distribution
+        unique_panda_ids = set()
+        for split_file in files_with_panda_id:
             filename = os.path.basename(split_file)
+            panda_id = self._extract_panda_id(filename)
+            if panda_id:
+                unique_panda_ids.add(panda_id)
+        
+        # Publish task files to their respective PandaID directories
+        published_count = 0
+        
+        for split_file in files_with_panda_id:
+            filename = os.path.basename(split_file)
+            panda_id = self._extract_panda_id(filename)
+            if not panda_id:
+                self.logger.warning(f"No PandaID found in {filename}, skipping")
+                continue
             
-            # Determine destination
-            if '-header.out' in filename:
-                # Header files go in queue directory
-                dest_path = os.path.join(queue_dir, filename)
-            else:
-                # Task files go in <queue>/<panda_id>/
-                panda_id = self._extract_panda_id(filename)
-                if not panda_id:
-                    # Should not happen since we filtered above, but safety check
-                    self.logger.warning(f"No PandaID found in {filename}, skipping")
-                    continue
-                
-                panda_dir = os.path.join(queue_dir, panda_id)
-                dest_path = os.path.join(panda_dir, filename)
+            panda_dir = os.path.join(queue_dir, panda_id)
+            dest_path = os.path.join(panda_dir, filename)
             
             # Publish file
             if dry_run:
@@ -290,7 +291,7 @@ class SlurmLogPublisher:
                 published_count += 1
             else:
                 try:
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    os.makedirs(panda_dir, exist_ok=True)
                     shutil.copy2(split_file, dest_path)
                     # Set world-readable permissions (rw-r--r--)
                     os.chmod(dest_path, 0o644)
@@ -299,7 +300,30 @@ class SlurmLogPublisher:
                 except Exception as e:
                     self.logger.error(f"Failed to publish {filename}: {e}")
         
+        # Task 26: Copy header file(s) to each PandaID directory
+        header_count = 0
+        if header_files:
+            for header_file in header_files:
+                header_filename = os.path.basename(header_file)
+                for panda_id in unique_panda_ids:
+                    panda_dir = os.path.join(queue_dir, panda_id)
+                    header_dest = os.path.join(panda_dir, header_filename)
+                    
+                    if dry_run:
+                        self.logger.info(f"[DRY-RUN] Would copy header: {header_file} -> {header_dest}")
+                        header_count += 1
+                    else:
+                        try:
+                            os.makedirs(panda_dir, exist_ok=True)
+                            shutil.copy2(header_file, header_dest)
+                            os.chmod(header_dest, 0o644)
+                            self.logger.debug(f"Published header to PandaID {panda_id}: {header_filename}")
+                            header_count += 1
+                        except Exception as e:
+                            self.logger.error(f"Failed to publish header to {panda_id}: {e}")
+        
         # Also copy pilotlog.txt files for each task with PandaID
+        pilotlog_count = 0
         for split_file in files_with_panda_id:
             filename = os.path.basename(split_file)
             panda_id = self._extract_panda_id(filename)
@@ -332,10 +356,10 @@ class SlurmLogPublisher:
                 self.logger.debug(f"pilotlog.txt not found for task {task_id}: {pilotlog_source}")
         
         self.logger.info(
-            f"Published {published_count}/{len(files_to_publish)} files + {pilotlog_count} pilotlog.txt to {queue_dir} "
-            f"({len(files_with_panda_id)} task files, {len(header_files)} header files, {pilotlog_count} pilotlogs)"
+            f"Published {published_count} task files + {header_count} header copies + {pilotlog_count} pilotlogs to {queue_dir} "
+            f"({len(unique_panda_ids)} unique PandaIDs)"
         )
-        return published_count + pilotlog_count
+        return published_count + header_count + pilotlog_count
     
     def _cleanup_old_directories(self, dry_run=False):
         """Remove PandaID directories older than retention_days within each queue"""

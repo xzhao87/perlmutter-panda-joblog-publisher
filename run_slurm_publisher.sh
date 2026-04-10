@@ -15,6 +15,60 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+# Function to find Python 3.11 or above
+# Returns the path to the first Python executable that meets requirements
+find_python() {
+    local MIN_MAJOR=3
+    local MIN_MINOR=11
+    
+    # Try common Python executable names in order of preference
+    # Start with versioned names, then fall back to generic names
+    local candidates=(
+        "/usr/bin/python3.13"
+        "/usr/bin/python3.12"
+        "/usr/bin/python3.11"
+        "python3.13"
+        "python3.12"
+        "python3.11"
+        "python3"
+        "python"
+    )
+    
+    for pyexec in "${candidates[@]}"; do
+        # Check if executable exists and is executable
+        if command -v "$pyexec" >/dev/null 2>&1; then
+            # Get the actual path (resolves if it's in PATH)
+            local pypath=$(command -v "$pyexec")
+            
+            # Check version
+            local version_output=$("$pypath" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+            
+            if [ $? -eq 0 ]; then
+                local major=$(echo "$version_output" | cut -d. -f1)
+                local minor=$(echo "$version_output" | cut -d. -f2)
+                
+                # Check if version meets requirements (>= 3.11)
+                if [ "$major" -gt "$MIN_MAJOR" ] || ([ "$major" -eq "$MIN_MAJOR" ] && [ "$minor" -ge "$MIN_MINOR" ]); then
+                    echo "$pypath"
+                    return 0
+                fi
+            fi
+        fi
+    done
+    
+    # If nothing found, return error
+    return 1
+}
+
+# Find Python 3.11+ automatically
+PYTHON=$(find_python)
+if [ $? -ne 0 ]; then
+    log "ERROR: Could not find Python 3.11 or above"
+    log "Please ensure Python 3.11+ is installed and in PATH or at /usr/bin/python3.11"
+    exit 1
+fi
+log "Using Python: $PYTHON ($($PYTHON --version 2>&1))"
+
 # Check if another instance is running
 if [ -f "$LOCK_FILE" ]; then
     PID=$(cat "$LOCK_FILE")
@@ -50,7 +104,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 # Run the publisher
-python3.11 "$PUBLISHER_SCRIPT" --config "$CONFIG_FILE"
+"$PYTHON" "$PUBLISHER_SCRIPT" --config "$CONFIG_FILE"
 EXIT_CODE=$?
 
 # Log completion
