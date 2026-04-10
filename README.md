@@ -82,3 +82,21 @@ python3 publish_slurm_logs.py --dry-run
 #SCRON --open-mode=truncate
 */10 * * * * /<harvester install dir>/publish-slurm-logs/run_slurm_publisher.sh
 ```
+
+## Integration with PanDA
+
+In order to publish these job URLs on panda monitor for specific jobs, the following changes are needed:
+
+### 1. in SLURM job template -- hardcode the GTAG value, e.g. 
+```
+export GTAG="https://portal.nersc.gov/cfs/m3763/panda/jobs/<panda queue name>"
+...
+srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG ...
+```
+
+### 2. make sure in the wrapper script, export it to container:
+```
+echo "export GTAG="$GTAG >> myEnv.sh
+```
+
+### 3. in pilot nersc plugin, change the get_pilot_id function to get the pilot id from the environment variable GTAG and append date/PandaID for direct log access.
