@@ -272,33 +272,63 @@ class SlurmLogPublisher:
                 file_patterns = [p.strip() for p in files_pattern.split(',')]
                 
                 for file_pattern in file_patterns:
-                    # Find matching files
-                    matching_files = list(src_dir.glob(file_pattern))
+                    # Find matching files and directories
+                    matching_items = list(src_dir.glob(file_pattern))
                     
-                    for src_file in matching_files:
-                        if not src_file.is_file():
-                            continue
-                        
-                        # Calculate relative path from task_dir to maintain structure
-                        try:
-                            rel_path = src_file.relative_to(task_dir)
-                            dest_file = os.path.join(panda_dir, rel_path)
-                            dest_dir = os.path.dirname(dest_file)
-                            
-                            if dry_run:
-                                self.logger.info(f"[DRY-RUN] Would copy failed task file: {src_file} -> {dest_file}")
-                                copied_count += 1
-                            else:
-                                try:
-                                    os.makedirs(dest_dir, exist_ok=True)
-                                    shutil.copy2(src_file, dest_file)
-                                    os.chmod(dest_file, 0o644)
-                                    self.logger.debug(f"Copied failed task file: {rel_path}")
+                    for src_item in matching_items:
+                        if src_item.is_file():
+                            # Handle individual files
+                            # Calculate relative path from task_dir to maintain structure
+                            try:
+                                rel_path = src_item.relative_to(task_dir)
+                                dest_file = os.path.join(panda_dir, rel_path)
+                                dest_dir = os.path.dirname(dest_file)
+                                
+                                if dry_run:
+                                    self.logger.info(f"[DRY-RUN] Would copy failed task file: {src_item} -> {dest_file}")
                                     copied_count += 1
-                                except Exception as e:
-                                    self.logger.warning(f"Failed to copy {src_file}: {e}")
-                        except ValueError as e:
-                            self.logger.warning(f"Could not compute relative path for {src_file}: {e}")
+                                else:
+                                    try:
+                                        os.makedirs(dest_dir, exist_ok=True)
+                                        shutil.copy2(src_item, dest_file)
+                                        os.chmod(dest_file, 0o644)
+                                        self.logger.debug(f"Copied failed task file: {rel_path}")
+                                        copied_count += 1
+                                    except Exception as e:
+                                        self.logger.warning(f"Failed to copy {src_item}: {e}")
+                            except ValueError as e:
+                                self.logger.warning(f"Could not compute relative path for {src_item}: {e}")
+                        
+                        elif src_item.is_dir():
+                            # Recursively copy directory and all its contents
+                            try:
+                                rel_path = src_item.relative_to(task_dir)
+                                dest_dir_path = os.path.join(panda_dir, rel_path)
+                                
+                                if dry_run:
+                                    # Count files in directory for accurate reporting
+                                    file_count = sum(1 for _ in src_item.rglob('*') if _.is_file())
+                                    self.logger.info(f"[DRY-RUN] Would recursively copy directory: {src_item} -> {dest_dir_path} ({file_count} files)")
+                                    copied_count += file_count
+                                else:
+                                    # Walk directory tree and copy each file
+                                    for root, dirs, files in os.walk(src_item):
+                                        for file in files:
+                                            src_file_path = os.path.join(root, file)
+                                            rel_file_path = Path(src_file_path).relative_to(task_dir)
+                                            dest_file_path = os.path.join(panda_dir, rel_file_path)
+                                            dest_file_dir = os.path.dirname(dest_file_path)
+                                            
+                                            try:
+                                                os.makedirs(dest_file_dir, exist_ok=True)
+                                                shutil.copy2(src_file_path, dest_file_path)
+                                                os.chmod(dest_file_path, 0o644)
+                                                self.logger.debug(f"Copied failed task file: {rel_file_path}")
+                                                copied_count += 1
+                                            except Exception as e:
+                                                self.logger.warning(f"Failed to copy {src_file_path}: {e}")
+                            except ValueError as e:
+                                self.logger.warning(f"Could not compute relative path for {src_item}: {e}")
         
         if copied_count > 0:
             self.logger.info(f"Copied {copied_count} additional files from failed task {task_dir}")

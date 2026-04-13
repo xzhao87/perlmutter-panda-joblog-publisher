@@ -30,7 +30,7 @@ For each successfully completed task, the publisher copies:
   - `paths.cfs_destination`: CFS directory for published logs
   - `timing.retention_days`: How long to keep published logs
   - `processing.split_script`: Path to split_slurm_output.py
-  - `additional_files_for_failed_tasks`: list of files to be copied to CFS for failed tasks (i.e. pilots), defined by users. 
+  - `additional_files_for_failed_tasks`: additional files/directories to be copied (recursively) to CFS for failed tasks (i.e. pilots), defined by users. 
 
 ### Main Script
 - **File**: `publish_slurm_logs.py`
