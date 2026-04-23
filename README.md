@@ -97,4 +97,4 @@ srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG ...
 echo "export GTAG="$GTAG >> myEnv.sh
 ```
 
-### 3. in pilot nersc plugin, change the get_pilot_id function to construct the pilot_id as "$GTAG/<PandaID>".
+### 3. use pilot version 3.13.0.23 or later.
