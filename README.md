@@ -8,7 +8,7 @@ This system automatically:
 1. Scans for finished SLURM jobs in harvester workdirs
 2. Splits combined SLURM output into per-task/per-PandaID files
 3. Copies pilotlog.txt from each task directory
-4. Publishes logs to CFS in organized structure of `&lt;panda queue name&gt;/&lt;Panda Job ID&gt;`
+4. Publishes logs to CFS in organized structure of `panda_queue_name/Panda_Job_ID`
 5. Cleans up old logs after retention period
 6. Tracks processed jobs to avoid re-processing
 
