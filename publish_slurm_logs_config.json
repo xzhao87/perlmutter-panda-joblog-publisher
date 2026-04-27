@@ -1,37 +1,69 @@
 {
     "description": "Configuration for automated SLURM log publishing to CFS",
+    "_comment_overview": "This configuration controls how SLURM job logs are published to the NERSC Science Gateway (CFS) for web access. The publisher scans harvester work directories, splits SLURM output by task/PandaID, and organizes files in a PandaID-centric structure.",
     
     "paths": {
+        "_comment": "All paths must be absolute. These are used by both the main script and parallel worker processes.",
         "workdir_root": "<pathname to the harvester workdir, right above the panda queue sub-directories>",
+        "_comment_workdir_root": "Root directory containing harvester work directories. Subdirectories are PanDA queue names (e.g., NERSC_Perlmutter_epic).",
+        
         "cfs_destination": "<pathname to the CFS directory, where panda queue sub-directories will be auto-created underneath>",
+        "_comment_cfs_destination": "CFS destination for published logs. Web accessible at https://portal.nersc.gov/cfs/m3763/panda/jobs/. Files organized as <queue>/<pandaid>/",
+        
         "state_file": "<where do you want the .slurm_publish_state.json to be placed>",
-        "log_file": "<pathname of the publisher log file>"
+        "_comment_state_file": "Global state file tracking processed jobs (old approach). Kept for migration compatibility and defense-in-depth.",
+        
+        "log_file": "<pathname of the publisher log file>",
+        "_comment_log_file": "Main log file for the publisher. Includes all INFO/WARNING/ERROR messages from main process and parallel workers."
     },
     
     "timing": {
-        "retention_days": 5
+        "_comment": "Time-related settings for cleanup and job age checking.",
+        "retention_days": 5,
+        "_comment_retention_days": "Number of days to keep published PandaID directories in CFS. Older directories are automatically deleted based on mtime."
     },
     
     "processing": {
+        "_comment": "Controls how SLURM jobs are processed and published.",
         "split_script": "<pathname to the split_slurm_output.py script>",
-        "delete_original_splits": true
+        "_comment_split_script": "Python script to split SLURM output by task/PandaID. Handles multiple PandaIDs per task.",
+        
+        "max_concurrent_jobs": 10,
+        "_comment_max_concurrent_jobs": "Maximum number of SLURM jobs to process in parallel. Lower for large files (3-5) to avoid I/O contention. Higher for small files (15-20) for faster processing. Implemented using Python multiprocessing.Pool.",
+        
+        "delete_original_splits": true,
+        "_comment_delete_original_splits": "Whether to delete split files (slurm-XXX-taskN-pandaXXX.out) from source after copying to CFS. Set false for debugging."
     },
     
     "filters": {
+        "_comment": "Criteria for which jobs to process.",
         "ignore_queues": [],
-        "min_job_age_seconds": 300
+        "_comment_ignore_queues": "List of queue names to skip (e.g., ['test_queue', 'disabled_queue']).",
+        
+        "only_completed_jobs": true,
+        "_comment_only_completed_jobs": "Only process jobs not in squeue (RUNNING/PENDING). Should always be true.",
+        
+        "min_job_age_seconds": 60,
+        "_comment_min_job_age_seconds": "Minimum age (seconds) of slurm-<jobid>.out file before processing. Ensures SLURM has finished writing output."
     },
 
     "additional_files_for_failed_tasks": [
         {
+            "_comment": "Task 28: For failed tasks (containing PanDA_Pilot-* subdirectory), copy additional files beyond pilotlog.txt. Each entry specifies glob patterns for source directory and files within that directory.",
+            
             "comment": "Payload stdout/stderr from PanDA_Pilot-* directory",
             "src_dir": "PanDA_Pilot-*",
-            "files": "payload.stdout,payload.stderr,preprocess*.txt"
+            "_comment_src_dir": "Glob pattern for source directory relative to task directory. Example: PanDA_Pilot-265737 matches PanDA_Pilot-*",
+            "files": "payload.stdout,payload.stderr",
+            "_comment_files": "Comma-separated glob patterns for files within src_dir. Supports wildcards (e.g., 'payload.*', 'preprocess*.txt')"
         },
         {
-            "comment": "CSV output files from workDir subdirectory",
-            "src_dir": "PanDA_Pilot-*/workDir",
-            "files": "dataprod_rel*.csv,test*.csv"
+            "comment": "Copy LOG subdirectory recursively for ePIC jobs",
+            "src_dir": "PanDA_Pilot-*/*/LOG",
+            "_comment_src_dir_recursive": "Can use multiple wildcards for nested paths. Example: PanDA_Pilot-265737/workDir/LOG",
+            "files": "*",
+            "_comment_files_recursive": "Use '*' to copy all files in directory. Directory structure is preserved at destination."
         }
-    ]    
+    ]
+    
 }

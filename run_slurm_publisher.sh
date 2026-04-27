@@ -24,6 +24,7 @@ find_python() {
     # Try common Python executable names in order of preference
     # Start with versioned names, then fall back to generic names
     local candidates=(
+	"/cvmfs/atlas.cern.ch/repo/ATLASLocalRootBase/x86_64/python/3.11.10-x86_64-el9/bin/python3.11"
         "/usr/bin/python3.13"
         "/usr/bin/python3.12"
         "/usr/bin/python3.11"

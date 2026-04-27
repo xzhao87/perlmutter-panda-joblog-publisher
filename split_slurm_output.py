@@ -9,18 +9,28 @@ tasks running in parallel, with each line prefixed by the task ID.
 The script:
 1. Reads the slurm-<jobid>.out file
 2. Separates output lines by task ID (format: "taskid: log line")
-3. Attempts to extract PandaID from each task's logs
-4. Creates individual output files named:
-   - slurm-<jobid>-task<taskid>-panda<pandaid>.out (if PandaID is found)
-   - slurm-<jobid>-task<taskid>.out (if PandaID is not found)
+3. Extracts ALL PandaIDs from each task's logs (a single pilot can process multiple jobs)
+4. Creates individual output files:
+   - If 1 PandaID: slurm-<jobid>-task<taskid>-panda<pandaid>.out
+   - If multiple PandaIDs: Creates separate file for EACH PandaID with same content
+   - If no PandaID: slurm-<jobid>-task<taskid>.out
 5. Keeps the original slurm-<jobid>.out file intact
 
 Usage:
     python3 split_slurm_output.py <path_to_slurm_output_file>
 
+Example:
+    python3 split_slurm_output.py /path/to/workdir/panda/NERSC_Perlmutter_epic/11270/slurm-50685843.out
+
 The script will create files in the same directory as the input file:
-    - slurm-<slurm job id>-task<task id>-panda<pandaID>.out
+    - slurm-50685843-task0-panda118014.out
+    - slurm-50685843-task1-panda118015.out
     - etc.
+    
+For tasks that process multiple PandaIDs (Task 29-b):
+    - slurm-51874506-task152-panda7111257044.out (full task log)
+    - slurm-51874506-task152-panda7111438591.out (duplicate of same full task log)
+    - slurm-51874506-task152-panda7111501056.out (duplicate of same full task log)
 """
 
 import sys
@@ -30,9 +40,12 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def extract_panda_id(lines):
+def extract_panda_ids(lines):
     """
-    Extract PandaID from task logs.
+    Extract ALL PandaIDs from task logs.
+    
+    A single pilot (task) can process multiple PandaID jobs during its lifetime.
+    This function finds all unique PandaIDs in the order they appear.
     
     Searches for patterns like:
     - 'PandaID': '118014'
@@ -43,7 +56,7 @@ def extract_panda_id(lines):
         lines: List of log lines for a specific task
     
     Returns:
-        PandaID as string if found, None otherwise
+        List of unique PandaIDs in order of appearance, or empty list if none found
     """
     # Pattern 1: 'PandaID': '118014' or "PandaID": "118014"
     panda_id_pattern1 = re.compile(r"['\"]PandaID['\"]:\s*['\"](\d+)['\"]")
@@ -54,21 +67,25 @@ def extract_panda_id(lines):
     # Pattern 3: PandaID=118014 (from URL-encoded strings)
     panda_id_pattern3 = re.compile(r"PandaID=(\d+)")
     
+    found_ids = []
+    seen = set()
+    
     for line in lines:
         # Try all patterns
         match = panda_id_pattern1.search(line)
-        if match:
-            return match.group(1)
+        if not match:
+            match = panda_id_pattern2.search(line)
+        if not match:
+            match = panda_id_pattern3.search(line)
         
-        match = panda_id_pattern2.search(line)
         if match:
-            return match.group(1)
-        
-        match = panda_id_pattern3.search(line)
-        if match:
-            return match.group(1)
+            panda_id = match.group(1)
+            # Add to list only if not seen before (preserve order)
+            if panda_id not in seen:
+                found_ids.append(panda_id)
+                seen.add(panda_id)
     
-    return None
+    return found_ids
 
 
 def split_slurm_output(slurm_file_path):
@@ -131,29 +148,55 @@ def split_slurm_output(slurm_file_path):
     print(f"Found {len(task_lines)} tasks")
     print(f"Untagged lines: {len(untagged_lines)}")
     
-    # Extract PandaID for each task and write output files
+    # Extract PandaID(s) for each task and write output files
     print("\nCreating individual task output files...")
     created_files = []
     
     for task_id in sorted(task_lines.keys()):
         lines = task_lines[task_id]
-        panda_id = extract_panda_id(lines)
+        panda_ids = extract_panda_ids(lines)
         
-        # Construct output filename
-        if panda_id:
-            output_filename = f"slurm-{slurm_job_id}-task{task_id}-panda{panda_id}.out"
-        else:
+        # Task 29-b: If a pilot processes multiple PandaIDs, create separate files for each
+        if len(panda_ids) == 0:
+            # No PandaID found - create single file without PandaID suffix
             output_filename = f"slurm-{slurm_job_id}-task{task_id}.out"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+            
+            created_files.append(output_filename)
+            print(f"  Task {task_id:3d}: {output_filename:50s} - {len(lines):6d} lines (PandaID not found)")
         
-        output_path = os.path.join(output_dir, output_filename)
+        elif len(panda_ids) == 1:
+            # Single PandaID - create single file with PandaID suffix
+            panda_id = panda_ids[0]
+            output_filename = f"slurm-{slurm_job_id}-task{task_id}-panda{panda_id}.out"
+            output_path = os.path.join(output_dir, output_filename)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+            
+            created_files.append(output_filename)
+            print(f"  Task {task_id:3d}: {output_filename:50s} - {len(lines):6d} lines (PandaID: {panda_id})")
         
-        # Write task output to file
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-        
-        created_files.append(output_filename)
-        panda_info = f" (PandaID: {panda_id})" if panda_id else " (PandaID not found)"
-        print(f"  Task {task_id:3d}: {output_filename:50s} - {len(lines):6d} lines{panda_info}")
+        else:
+            # Multiple PandaIDs - create duplicate files for each PandaID
+            # This happens when one pilot processes multiple jobs
+            for panda_id in panda_ids:
+                output_filename = f"slurm-{slurm_job_id}-task{task_id}-panda{panda_id}.out"
+                output_path = os.path.join(output_dir, output_filename)
+                
+                # Write the SAME content (entire task log) for each PandaID
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+                
+                created_files.append(output_filename)
+            
+            panda_info = ", ".join(panda_ids)
+            print(f"  Task {task_id:3d}: Created {len(panda_ids)} files for multiple PandaIDs: {panda_info}")
+            print(f"             ({len(lines):6d} lines each)")
+    
     
     # Optionally write untagged lines to a separate file
     if untagged_lines:
