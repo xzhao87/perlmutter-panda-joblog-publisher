@@ -18,16 +18,17 @@ The script:
 
 Usage:
     python3 split_slurm_output.py <path_to_slurm_output_file>
+    python3 split_slurm_output.py /path/to/workdir/panda/NERSC_Perlmutter_epic/11270/slurm-50685843.out
 
 Example:
-    python3 split_slurm_output.py /path/to/workdir/panda/NERSC_Perlmutter_epic/11270/slurm-50685843.out
+    python3 split_slurm_output.py /global/homes/x/xin/ws-panda/epic-harvester-workdir/panda/NERSC_Perlmutter_epic/11270/slurm-50685843.out
 
 The script will create files in the same directory as the input file:
     - slurm-50685843-task0-panda118014.out
     - slurm-50685843-task1-panda118015.out
     - etc.
     
-For tasks that process multiple PandaIDs (Task 29-b):
+For tasks that process multiple PandaIDs:
     - slurm-51874506-task152-panda7111257044.out (full task log)
     - slurm-51874506-task152-panda7111438591.out (duplicate of same full task log)
     - slurm-51874506-task152-panda7111501056.out (duplicate of same full task log)
@@ -156,7 +157,7 @@ def split_slurm_output(slurm_file_path):
         lines = task_lines[task_id]
         panda_ids = extract_panda_ids(lines)
         
-        # Task 29-b: If a pilot processes multiple PandaIDs, create separate files for each
+        # If a pilot processes multiple PandaIDs, create separate files for each
         if len(panda_ids) == 0:
             # No PandaID found - create single file without PandaID suffix
             output_filename = f"slurm-{slurm_job_id}-task{task_id}.out"

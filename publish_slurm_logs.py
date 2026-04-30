@@ -13,32 +13,17 @@ File structure in CFS:
 Usage:
   python3 publish_slurm_logs.py [--config CONFIG_FILE] [--dry-run]
 
-Recent Fixes:
-  2026-04-23: Lock file cleanup after publishing
-              - Delete .slurm-<jobid>.lock files after successful publish
-              - Prevents accumulation of stale lock files in worker directories
-              - Safe because .publish-done marker provides permanent tracking
-  2026-04-23: Task 32 - Fixed failed task file copying for multi-PandaID pilots
-              - Extract PandaID from PanDA_Pilot-<pandaid> directory name
-              - Only copy failed task files to the CORRECT PandaID directory
-              - Prevents duplicating failed task files across all PandaIDs
-  2026-04-23: Task 31 - Migration compatibility for dual-defense tracking
-              - Updated _is_job_published() to check BOTH marker file AND state file
-              - Prevents republishing old jobs when upgrading from old system
-              - Automatically creates marker files for old jobs during migration
-  2026-04-23: Task 29 - Parallel processing with lock files and .publish-done markers
-              - Implemented parallel job processing with max_concurrent_jobs limit
-              - Added lock files to prevent concurrent processing of same job
-              - Added .publish-done marker files for reliable tracking
-              - Updated split script to handle multiple PandaIDs per task
-              - Updated pilotlog.txt handling to copy to ALL PandaID directories
-  2026-04-10: Added support for copying additional files from failed tasks (Task 28)
-  2026-04-10: Changed header files to be copied to each PandaID directory 
-  2026-04-09: Removed date directory layer to avoid race condition between pilot and publisher
-  2026-04-09: Updated cleanup to use PandaID directory mtime instead of date parsing
-  2026-04-06: Fixed cleanup function to iterate through queue subdirectories
-  2026-04-02: Fixed file permissions to 0o644 for web accessibility
-  2026-04-02: Fixed job detection to handle random glob ordering
+Key Features:
+  - Parallel processing of multiple SLURM jobs with configurable concurrency
+  - Lock files prevent concurrent processing of the same job
+  - Dual-defense tracking: marker files (.publish-done) + state file for reliability
+  - Migration compatible: checks both old and new tracking mechanisms
+  - Handles pilots that process multiple PandaIDs correctly
+  - Copies failed task files (payload.stdout, etc.) based on configurable patterns
+  - Extracts PandaID from PanDA_Pilot-<pandaid> to avoid duplicating failed files
+  - Sets proper file permissions (0o644) for web accessibility
+  - Automatic cleanup of old logs after retention period
+  - Copies header files and pilotlog.txt to each PandaID directory
 """
 
 import os
@@ -68,6 +53,9 @@ def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
     class MinimalPublisher:
         def __init__(self, cfg):
             self.config = cfg
+            # Load state for tracking processed jobs
+            # Needed by _is_job_published method to check old state file for migration compatibility
+            self.state = self._load_state()
             # Setup minimal logging for this process
             log_file = cfg['paths']['log_file']
             logging.basicConfig(
@@ -76,6 +64,26 @@ def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
                 handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
             )
             self.logger = logging.getLogger(f"{__name__}.worker.{job_id}")
+        
+        def _load_state(self):
+            """
+            Load state tracking (which jobs have been processed).
+            
+            This method is needed by MinimalPublisher to support
+            the migration compatibility check in _is_job_published().
+            """
+            state_file = self.config['paths']['state_file']
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, 'r') as f:
+                        return json.load(f)
+                except Exception as e:
+                    # If state file is corrupted or unreadable, return empty state
+                    return {'processed_jobs': {}, 'last_run': None}
+            return {
+                'processed_jobs': {},  # {queue: {slurm_job_id: timestamp}}
+                'last_run': None
+            }
         
         # Copy necessary methods from SlurmLogPublisher
         _acquire_job_lock = SlurmLogPublisher._acquire_job_lock
@@ -204,10 +212,10 @@ class SlurmLogPublisher:
         Check if job has already been published.
         
         Checks both:
-        1. Marker file (.publish-done) - new approach (Task 29+)
-        2. State file - old approach (pre-Task 29, kept for migration)
+        1. Marker file (.publish-done) - newer tracking approach
+        2. State file - older approach (kept for migration compatibility)
         
-        Task 31: This dual check ensures old jobs published by the old system
+        This dual check ensures old jobs published by the old system
         (which only used .slurm_publish_state.json) are not republished after
         upgrading to the new system.
         
@@ -370,7 +378,7 @@ class SlurmLogPublisher:
         """
         Check if a task processed multiple PandaID jobs.
         
-        Task 29-c: When a pilot processes multiple PandaIDs, there will be multiple
+        When a pilot processes multiple PandaIDs, there will be multiple
         files with the same task ID but different PandaIDs.
         
         Returns: True if task has multiple PandaIDs, False otherwise
@@ -429,10 +437,10 @@ class SlurmLogPublisher:
         """
         Copy additional files from failed tasks to CFS.
         
-        Task 28: For failed tasks (containing PanDA_Pilot-* subdirectory), copy
+        For failed tasks (containing PanDA_Pilot-* subdirectory), copy
         additional files as specified in config's additional_files_for_failed_tasks.
         
-        Task 32: Only copy to the CORRECT PandaID directory! When a pilot processes
+        Only copy to the CORRECT PandaID directory! When a pilot processes
         multiple PandaIDs, the PanDA_Pilot-<pandaid> directory name tells us which
         PandaID the failed files belong to. Only copy if panda_id matches the
         pilot directory's PandaID.
@@ -449,7 +457,7 @@ class SlurmLogPublisher:
         if not is_failed:
             return 0
         
-        # Task 32: Check if this panda_id matches the pilot directory's PandaID
+        # Check if this panda_id matches the pilot directory's PandaID
         # Only copy failed task files to the CORRECT PandaID directory
         if pilot_panda_id and pilot_panda_id != panda_id:
             self.logger.debug(
@@ -563,8 +571,8 @@ class SlurmLogPublisher:
           <queue_name>/<panda_id>/slurm-<jobid>-header.out
           <queue_name>/<panda_id>/pilotlog.txt
         
-        Task 19: Only publish files from tasks that have PandaIDs.
-        Task 26: Copy header file to each PandaID directory.
+        Only publishes files from tasks that have PandaIDs.
+        Copies header file to each PandaID directory.
         If NO tasks have PandaIDs, skip the entire job.
         If SOME tasks have PandaIDs, publish only those + header to each PandaID dir.
         """
@@ -594,7 +602,7 @@ class SlurmLogPublisher:
             else:
                 files_without_panda_id.append(task_file)
         
-        # Task 19: If NO tasks have PandaIDs, skip publishing entirely
+        # If NO tasks have PandaIDs, skip publishing entirely
         if not files_with_panda_id:
             self.logger.warning(
                 f"No PandaIDs found in any task files "
@@ -647,7 +655,7 @@ class SlurmLogPublisher:
                 except Exception as e:
                     self.logger.error(f"Failed to publish {filename}: {e}")
         
-        # Task 26: Copy header file(s) to each PandaID directory
+        # Copy header file(s) to each PandaID directory
         header_count = 0
         if header_files:
             for header_file in header_files:
@@ -708,7 +716,7 @@ class SlurmLogPublisher:
             else:
                 self.logger.debug(f"pilotlog.txt not found for task {task_id}: {pilotlog_source}")
         
-        # Task 28: Copy additional files from failed tasks
+        # Copy additional files from failed tasks
         failed_task_files_count = 0
         for split_file in files_with_panda_id:
             filename = os.path.basename(split_file)
@@ -810,7 +818,7 @@ class SlurmLogPublisher:
                 self.logger.warning(f"No split files created for job {job_id}")
                 return False, 0
             
-            # Publish to CFS (Task 19: only publishes files with PandaIDs)
+            # Publish to CFS (only publishes files with PandaIDs)
             # Also publishes pilotlog.txt for each task (unless multi-PandaID task)
             pub_count = self._publish_files(split_files, queue_name, worker_dir, job_id, dry_run=dry_run)
             
@@ -844,7 +852,7 @@ class SlurmLogPublisher:
         """
         Process all finished jobs for a queue.
         
-        Task 29-e: Implements parallel processing with max_concurrent_jobs limit.
+        Implements parallel processing with max_concurrent_jobs limit.
         Each job is processed in a separate call to _process_single_job, with
         lock files preventing concurrent processing of the same job.
         """
@@ -887,7 +895,7 @@ class SlurmLogPublisher:
             self.state['processed_jobs'][queue_name] = {}
         processed_state = self.state['processed_jobs'][queue_name]
         
-        # Task 29-e: Process jobs with parallelism, respecting max_concurrent_jobs
+        # Process jobs with parallelism, respecting max_concurrent_jobs
         max_concurrent = self.config['processing'].get('max_concurrent_jobs', 5)
         processed_count = 0
         

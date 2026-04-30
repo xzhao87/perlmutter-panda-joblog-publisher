@@ -100,8 +100,8 @@ For failed tasks (containing `PanDA_Pilot-*` directory), additional files are co
 ├── <panda queue name>/
 │   ├── 11270/                    # Worker directory
 │   │   ├── slurm-50685843.out    # Combined SLURM output
-│   │   ├── 0/                    # Task 0 directory
-│   │   ├── 1/                    # Task 1 directory
+│   │   ├── 50685843/0/           # Directory of task 0 of slurm job 50685843   
+│   │   ├── 50685843/1/           # Directory of task 1 of slurm job 50685843
 │   │   └── ...
 │   └── 11271/
 └── Other_Queue/
