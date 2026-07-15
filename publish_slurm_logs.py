@@ -99,6 +99,9 @@ def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
         _task_has_multiple_panda_ids = SlurmLogPublisher._task_has_multiple_panda_ids
         _is_failed_task = SlurmLogPublisher._is_failed_task
         _copy_additional_files_for_failed_task = SlurmLogPublisher._copy_additional_files_for_failed_task
+        _find_presplit_task_files = SlurmLogPublisher._find_presplit_task_files
+        _extract_panda_ids_from_file = SlurmLogPublisher._extract_panda_ids_from_file
+        _publish_presplit_files = SlurmLogPublisher._publish_presplit_files
     
     publisher = MinimalPublisher(config)
     return publisher._process_single_job(queue_name, worker_dir, item, job_id, dry_run)
@@ -355,6 +358,68 @@ class SlurmLogPublisher:
         except Exception as e:
             self.logger.error(f"Split error: {e}")
             return []
+    
+    def _find_presplit_task_files(self, worker_dir, job_id):
+        """
+        Find pre-split task files when SLURM writes separate output per task.
+        
+        When single_slurm_out_file is false, SLURM writes each task to:
+          - slurm<jobid>-task<taskid>.out (stdout)
+          - slurm<jobid>-task<taskid>.err (stderr)
+        
+        Returns: list of (task_out_file, task_err_file) tuples
+        """
+        task_files = []
+        
+        # Find all task .out files
+        pattern = f'slurm{job_id}-task*.out'
+        out_files = list(Path(worker_dir).glob(pattern))
+        
+        for out_file in out_files:
+            # Extract task ID from filename
+            match = re.search(r'slurm\d+-task(\d+)\.out$', out_file.name)
+            if not match:
+                continue
+            
+            task_id = match.group(1)
+            
+            # Find corresponding .err file
+            err_file = out_file.with_suffix('.err')
+            if not err_file.exists():
+                self.logger.warning(f"Missing .err file for task {task_id}: {err_file}")
+                # Continue anyway, stderr might be empty
+            
+            task_files.append((str(out_file), str(err_file) if err_file.exists() else None))
+        
+        self.logger.info(f"Found {len(task_files)} pre-split task files for job {job_id}")
+        return task_files
+    
+    def _extract_panda_ids_from_file(self, file_path):
+        """
+        Extract all PandaIDs from a task output file.
+        
+        A single pilot/task can process multiple PandaID jobs during its lifetime.
+        This function finds all unique PandaIDs mentioned in the file.
+        
+        Returns: list of PandaID strings (in order of first appearance)
+        """
+        panda_ids = []
+        seen = set()
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    # Look for PandaID in various formats
+                    # Common patterns: 'PandaID': 1010560, "PandaID": 1010560, PandaID=1010560
+                    matches = re.findall(r'["\']?PandaID["\']?\s*[:=]\s*(\d+)', line)
+                    for panda_id in matches:
+                        if panda_id not in seen:
+                            panda_ids.append(panda_id)
+                            seen.add(panda_id)
+        except Exception as e:
+            self.logger.warning(f"Error reading {file_path}: {e}")
+        
+        return panda_ids
     
     def _extract_panda_id(self, filename):
         """
@@ -741,6 +806,160 @@ class SlurmLogPublisher:
         )
         return published_count + header_count + pilotlog_count + failed_task_files_count
     
+    def _publish_presplit_files(self, task_files, queue_name, worker_dir, job_id, dry_run=False):
+        """
+        Publish pre-split task files to CFS.
+        
+        When single_slurm_out_file is false, SLURM writes each task to separate files:
+          - slurm<jobid>-task<taskid>.out (stdout)
+          - slurm<jobid>-task<taskid>.err (stderr)
+        
+        For each task file with PandaIDs:
+        1. Extract ALL PandaIDs from the .out file (a task can process multiple jobs)
+        2. Copy the .out file to each PandaID directory
+        3. Copy the corresponding .err file to each PandaID directory
+        4. Copy the overall slurm-<jobid>.out file to each PandaID directory
+        5. Copy pilotlog.txt to each PandaID directory
+        6. Copy additional files for failed tasks (if configured)
+        
+        Args:
+            task_files: list of (task_out_file, task_err_file) tuples
+            queue_name: PanDA queue name
+            worker_dir: harvester worker directory
+            job_id: SLURM job ID
+            dry_run: if True, only log what would be done
+        
+        Returns: number of files published
+        """
+        cfs_root = self.config['paths']['cfs_destination']
+        queue_dir = os.path.join(cfs_root, queue_name)
+        
+        # Overall slurm job output file (contains generic SLURM info)
+        slurm_main_out = os.path.join(worker_dir, f'slurm-{job_id}.out')
+        
+        # Track unique PandaIDs and tasks
+        panda_id_to_tasks = {}  # {panda_id: [(task_id, out_file, err_file), ...]}
+        tasks_without_panda = []
+        
+        # Process each task file to extract PandaIDs
+        for task_out_file, task_err_file in task_files:
+            # Extract task ID from filename
+            match = re.search(r'slurm\d+-task(\d+)\.out$', os.path.basename(task_out_file))
+            if not match:
+                continue
+            task_id = match.group(1)
+            
+            # Extract PandaIDs from task output
+            panda_ids = self._extract_panda_ids_from_file(task_out_file)
+            
+            if not panda_ids:
+                tasks_without_panda.append(task_id)
+                continue
+            
+            # Associate this task with all PandaIDs it processed
+            for panda_id in panda_ids:
+                if panda_id not in panda_id_to_tasks:
+                    panda_id_to_tasks[panda_id] = []
+                panda_id_to_tasks[panda_id].append((task_id, task_out_file, task_err_file))
+        
+        # If NO tasks have PandaIDs, skip publishing
+        if not panda_id_to_tasks:
+            self.logger.warning(
+                f"No PandaIDs found in any task files "
+                f"({len(tasks_without_panda)} tasks without PandaID). "
+                f"Skipping publication for this job."
+            )
+            return 0
+        
+        # Log partial task case
+        if tasks_without_panda:
+            self.logger.info(
+                f"Partial PandaID coverage: {len(panda_id_to_tasks)} unique PandaIDs, "
+                f"{len(tasks_without_panda)} tasks without PandaID. "
+                f"Publishing only tasks with PandaIDs."
+            )
+        
+        # Publish files for each PandaID
+        published_count = 0
+        
+        for panda_id, tasks in panda_id_to_tasks.items():
+            panda_dir = os.path.join(queue_dir, panda_id)
+            
+            for task_id, task_out_file, task_err_file in tasks:
+                # 1. Copy task .out file
+                out_dest = os.path.join(panda_dir, f'slurm{job_id}-task{task_id}.out')
+                if dry_run:
+                    self.logger.info(f"[DRY-RUN] Would copy: {task_out_file} -> {out_dest}")
+                    published_count += 1
+                else:
+                    try:
+                        os.makedirs(panda_dir, exist_ok=True)
+                        shutil.copy2(task_out_file, out_dest)
+                        os.chmod(out_dest, 0o644)
+                        self.logger.debug(f"Published task stdout: {os.path.basename(out_dest)}")
+                        published_count += 1
+                    except Exception as e:
+                        self.logger.error(f"Failed to publish {task_out_file}: {e}")
+                
+                # 2. Copy task .err file (if exists)
+                if task_err_file and os.path.exists(task_err_file):
+                    err_dest = os.path.join(panda_dir, f'slurm{job_id}-task{task_id}.err')
+                    if dry_run:
+                        self.logger.info(f"[DRY-RUN] Would copy: {task_err_file} -> {err_dest}")
+                        published_count += 1
+                    else:
+                        try:
+                            shutil.copy2(task_err_file, err_dest)
+                            os.chmod(err_dest, 0o644)
+                            self.logger.debug(f"Published task stderr: {os.path.basename(err_dest)}")
+                            published_count += 1
+                        except Exception as e:
+                            self.logger.error(f"Failed to publish {task_err_file}: {e}")
+                
+                # 3. Copy pilotlog.txt
+                pilotlog_source = os.path.join(worker_dir, job_id, task_id, 'pilotlog.txt')
+                if os.path.exists(pilotlog_source):
+                    pilotlog_dest = os.path.join(panda_dir, f'pilotlog-task{task_id}.txt')
+                    if dry_run:
+                        self.logger.info(f"[DRY-RUN] Would copy: {pilotlog_source} -> {pilotlog_dest}")
+                        published_count += 1
+                    else:
+                        try:
+                            shutil.copy2(pilotlog_source, pilotlog_dest)
+                            os.chmod(pilotlog_dest, 0o644)
+                            self.logger.debug(f"Published pilotlog for task {task_id}")
+                            published_count += 1
+                        except Exception as e:
+                            self.logger.warning(f"Failed to copy pilotlog for task {task_id}: {e}")
+                
+                # 4. Copy additional files from failed tasks
+                task_dir = os.path.join(worker_dir, job_id, task_id)
+                failed_count = self._copy_additional_files_for_failed_task(
+                    task_dir, panda_id, queue_dir, dry_run=dry_run
+                )
+                published_count += failed_count
+            
+            # 5. Copy overall slurm-<jobid>.out to each PandaID directory (once per PandaID)
+            if os.path.exists(slurm_main_out):
+                main_dest = os.path.join(panda_dir, f'slurm-{job_id}.out')
+                if dry_run:
+                    self.logger.info(f"[DRY-RUN] Would copy: {slurm_main_out} -> {main_dest}")
+                    published_count += 1
+                else:
+                    try:
+                        shutil.copy2(slurm_main_out, main_dest)
+                        os.chmod(main_dest, 0o644)
+                        self.logger.debug(f"Published main SLURM output to PandaID {panda_id}")
+                        published_count += 1
+                    except Exception as e:
+                        self.logger.error(f"Failed to publish main SLURM output to {panda_id}: {e}")
+        
+        self.logger.info(
+            f"Published {published_count} files to {queue_dir} "
+            f"({len(panda_id_to_tasks)} unique PandaIDs)"
+        )
+        return published_count
+    
     def _cleanup_old_directories(self, dry_run=False):
         """Remove PandaID directories older than retention_days within each queue"""
         cfs_root = self.config['paths']['cfs_destination']
@@ -806,35 +1025,50 @@ class SlurmLogPublisher:
         try:
             self.logger.info(f"Processing queue={queue_name} worker={item} job={job_id}")
             
-            # Find slurm output file
-            slurm_file = os.path.join(worker_dir, f'slurm-{job_id}.out')
-            if not os.path.exists(slurm_file):
-                self.logger.warning(f"SLURM output not found: {slurm_file}")
-                return False, 0
+            # Check processing mode
+            single_slurm_out_file = self.config['processing'].get('single_slurm_out_file', True)
             
-            # Split output
-            split_files = self._split_slurm_output(slurm_file)
-            if not split_files:
-                self.logger.warning(f"No split files created for job {job_id}")
-                return False, 0
+            if single_slurm_out_file:
+                # Legacy mode: one big slurm-<jobid>.out file containing all tasks
+                # Need to split it first
+                slurm_file = os.path.join(worker_dir, f'slurm-{job_id}.out')
+                if not os.path.exists(slurm_file):
+                    self.logger.warning(f"SLURM output not found: {slurm_file}")
+                    return False, 0
+                
+                # Split output
+                split_files = self._split_slurm_output(slurm_file)
+                if not split_files:
+                    self.logger.warning(f"No split files created for job {job_id}")
+                    return False, 0
+                
+                # Publish to CFS (only publishes files with PandaIDs)
+                pub_count = self._publish_files(split_files, queue_name, worker_dir, job_id, dry_run=dry_run)
+                
+                # Clean up split files if configured (regardless of publish count)
+                if not dry_run and self.config['processing']['delete_original_splits']:
+                    for f in split_files:
+                        try:
+                            os.remove(f)
+                        except Exception as e:
+                            self.logger.warning(f"Could not remove {f}: {e}")
             
-            # Publish to CFS (only publishes files with PandaIDs)
-            # Also publishes pilotlog.txt for each task (unless multi-PandaID task)
-            pub_count = self._publish_files(split_files, queue_name, worker_dir, job_id, dry_run=dry_run)
+            else:
+                # New mode: each task writes to separate .out and .err files
+                # Files are already split: slurm<jobid>-task<taskid>.out and .err
+                task_files = self._find_presplit_task_files(worker_dir, job_id)
+                if not task_files:
+                    self.logger.warning(f"No task files found for job {job_id}")
+                    return False, 0
+                
+                # Publish pre-split files to CFS
+                pub_count = self._publish_presplit_files(task_files, queue_name, worker_dir, job_id, dry_run=dry_run)
             
             if pub_count == 0:
                 self.logger.info(
                     f"Job {job_id}: No files published (no PandaIDs found). "
                     f"Marking as processed to avoid reprocessing."
                 )
-            
-            # Clean up split files if configured (regardless of publish count)
-            if not dry_run and self.config['processing']['delete_original_splits']:
-                for f in split_files:
-                    try:
-                        os.remove(f)
-                    except Exception as e:
-                        self.logger.warning(f"Could not remove {f}: {e}")
             
             # Mark as published using both mechanisms for reliability:
             # 1. Marker file (new approach)

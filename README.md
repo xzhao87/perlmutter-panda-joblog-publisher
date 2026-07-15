@@ -1,6 +1,6 @@
 # SLURM Log Publisher System
 
-Automated system for publishing SLURM job logs to NERSC Science Gateway in a PanDA-centric directory structure.
+Automated system for publishing SLURM job logs to web-accessible storage in a PanDA-centric directory structure.
 
 ## Quick Start
 
@@ -8,27 +8,29 @@ For first-time users, follow these steps:
 
 ```bash
 # 1. Verify configuration
-cat publish_slurm_logs_config.json (follow comments to make necessary changes, see later sections for more detailed config info) 
+cat publish_slurm_logs_config.json
+# Follow comments to make necessary changes
+# See Configuration section below for details
 
 # 2. Test with dry-run
 python3 publish_slurm_logs.py --dry-run
 
-# 3. Create CFS directories (if not exists), e.g : 
-mkdir -p /global/cfs/cdirs/<nersc project name>/www/panda/jobs
-chmod 755 /global/cfs/cdirs/<nersc project name>/www/panda/jobs
+# 3. Create web-accessible directories (if not exists)
+mkdir -p /path/to/web/directory/panda/jobs
+chmod 755 /path/to/web/directory/panda/jobs
 
 # 4. Run manually to test
 python3 publish_slurm_logs.py
 
-# 5. Set up scrontab for automation
-scrontab -e
-(to run it every 10 minutes : */10 * * * * /path/to/run_slurm_publisher.sh)
+# 5. Set up cron/scrontab for automation
+# Run every 10 minutes:
+# */10 * * * * /path/to/run_slurm_publisher.sh
 
 # 6. Verify logs are published
-ls -la /global/cfs/cdirs/<nersc project name>/www/panda/jobs/
+ls -la /path/to/web/directory/panda/jobs/
 
-# 7. Access via web
-# https://portal.nersc.gov/cfs/<nersc project name>/panda/jobs/<panda queue name>/<pandaid>/
+# 7. Access via web browser
+# https://your-web-portal/panda/jobs/<queue_name>/<pandaid>/
 ```
 
 **See "Installation" section below for detailed setup instructions.**
@@ -36,157 +38,320 @@ ls -la /global/cfs/cdirs/<nersc project name>/www/panda/jobs/
 ## Overview
 
 This system automatically:
-1. Scans for finished SLURM jobs in harvester workdirs
-2. Splits combined SLURM output into per-task/per-PandaID files (handles multiple PandaIDs per task)
-3. Copies pilotlog.txt from each task directory to all PandaID directories
-4. Copies additional files from failed tasks (payload.stdout, payload.stderr, etc.)
-5. Publishes logs to CFS in PandaID-organized structure
-6. Processes jobs in parallel with configurable concurrency limits
-7. Cleans up old logs after retention period
-8. Tracks processed jobs using dual mechanisms (marker files + state file) to avoid re-processing
+1. Scans for finished SLURM jobs in harvester work directories
+2. **Processes SLURM output** (supports two modes - see below)
+3. Extracts PandaIDs and organizes files by PandaID
+4. Copies pilotlog.txt from each task directory
+5. Copies additional files from failed tasks (payload.stdout, payload.stderr, etc.)
+6. Publishes logs to web-accessible storage
+7. Processes jobs in parallel with configurable concurrency
+8. Cleans up old logs after retention period
+9. Tracks processed jobs to avoid re-processing
+
+## SLURM Logging Modes
+
+The publisher supports **two modes** for handling SLURM task output, controlled by the `single_slurm_out_file` configuration option:
+
+### Legacy Mode (single_slurm_out_file: true)
+
+**How it works:**
+- All SLURM tasks write to **one big output file**: `slurm-<jobid>.out`
+- Publisher splits this file into per-task, per-PandaID files using `split_slurm_output.py`
+- Handles interleaved output from multiple concurrent tasks
+
+**When to use:**
+- Default SLURM configuration (no special `--output` flags)
+- Existing deployments with standard SLURM templates
+- When you need backward compatibility
+
+**SLURM template:**
+```bash
+srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG \
+     --label -n $HARVESTER_NTASKS \
+     /bin/bash ./wrapper.sh ...
+# Output goes to default slurm-<jobid>.out
+```
+
+**Published files per PandaID:**
+- `slurm-<jobid>-task<taskid>-panda<pandaid>.out` - Task output for this PandaID
+- `slurm-<jobid>-header.out` - Untagged SLURM output (wrapper info)
+- `pilotlog.txt` - Complete pilot log
+
+### New Mode (single_slurm_out_file: false)
+
+**How it works:**
+- Each SLURM task writes to **separate files**: `slurm<jobid>-task<taskid>.out` and `.err`
+- Publisher processes pre-split files directly (no splitting needed)
+- Cleaner separation of stdout and stderr
+
+**Benefits:**
+- **Memory efficient** - No need to load large files for splitting
+- **Faster processing** - Direct file copy instead of split-then-copy
+- **Better debugging** - Separate stderr files, no interleaved output
+- **Task isolation** - Each task's output in its own files
+
+**When to use:**
+- New deployments where you control the SLURM template
+- Large-scale operations with many tasks per job
+- When you need separate stderr for debugging
+
+**SLURM template:**
+```bash
+srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG \
+     --output=slurm%j-task%t.out \
+     --error=slurm%j-task%t.err \
+     -n $HARVESTER_NTASKS \
+     /bin/bash ./wrapper.sh ...
+# Each task creates separate .out and .err files
+```
+
+**Published files per PandaID:**
+- `slurm<jobid>-task<taskid>.out` - Task stdout
+- `slurm<jobid>-task<taskid>.err` - Task stderr (separate file)
+- `slurm-<jobid>.out` - Overall SLURM job info
+- `pilotlog-task<taskid>.txt` - Pilot log
+
+**Note:** In both modes, when a single pilot processes multiple PandaIDs, files are copied to each PandaID directory so users have complete context.
 
 ## Published Files
 
-For each successfully completed task, the publisher copies:
-- **SLURM split output**: Infrastructure/wrapper/pilot logs from SLURM stdout/stderr
-- **pilotlog.txt**: Complete pilot logs including payload stdout/stderr and errors
-- **Header file**: Untagged lines from SLURM output (wrapper-level info)
+For each successfully completed task:
+- **SLURM output**: Infrastructure/wrapper/pilot logs
+  - Format depends on mode (see above)
+  - Duplicated to each PandaID directory when pilot processes multiple jobs
+- **pilotlog.txt** or **pilotlog-task<taskid>.txt**: Complete pilot logs
+  - Contains payload stdout/stderr and errors
+  - Copied to EACH PandaID directory
 
-For failed tasks (containing `PanDA_Pilot-*` directory), additional files are copied:
-- See `additional_files_for_failed_tasks` in config for patterns
+For failed tasks (containing `PanDA_Pilot-*` directory):
+- Additional files copied based on `additional_files_for_failed_tasks` config patterns
+- Examples: `payload.stdout`, `payload.stderr`, `workDir/*.csv`
 
 ## Components
 
 ### Configuration File
-- **File**: `publish_slurm_logs_config.json`
-- **Purpose**: Central configuration for paths, timing, and behavior
-- **Key settings**:
-  - `paths.workdir_root`: Where harvester places worker directories
-  - `paths.cfs_destination`: CFS directory for published logs
-  - `timing.retention_days`: How long to keep published logs
-  - `processing.split_script`: Path to split_slurm_output.py
-  - `processing.max_concurrent_jobs`: Maximum parallel job processing (default: 10)
-  - `processing.delete_original_splits`: Clean up split files after publishing
-  - `additional_files_for_failed_tasks`: Patterns for copying extra files from failed tasks
+**File**: `publish_slurm_logs_config.json`
+
+**Key settings:**
+
+```json
+{
+  "paths": {
+    "workdir_root": "/path/to/harvester/workdir",
+    "cfs_destination": "/path/to/web/directory/jobs"
+  },
+  "timing": {
+    "retention_days": 5
+  },
+  "processing": {
+    "single_slurm_out_file": true,
+    "split_script": "/path/to/split_slurm_output.py",
+    "max_concurrent_jobs": 10,
+    "delete_original_splits": true
+  },
+  "additional_files_for_failed_tasks": [
+    "payload.stdout", "payload.stderr", "workDir/*.csv"
+  ]
+}
+```
+
+**Configuration options:**
+- `single_slurm_out_file`: Choose logging mode (true=legacy, false=new pre-split)
+- `split_script`: Path to split script (only used when `single_slurm_out_file` is true)
+- `delete_original_splits`: Clean up split files (only applies in legacy mode)
+- `max_concurrent_jobs`: Parallel processing limit (adjust based on I/O load)
 
 ### Main Script
-- **File**: `publish_slurm_logs.py`
-- **Purpose**: Core logic for scanning, splitting, and publishing
-- **Features**:
-  - Checks if SLURM jobs are finished (not in queue, old enough)
-  - Splits SLURM output using split_slurm_output.py (handles multiple PandaIDs per task)
-  - Organizes files by PandaID
-  - Copies pilotlog.txt to all PandaID directories
-  - Copies additional files from failed tasks (configurable patterns)
-  - Sets world-readable permissions (0o644) for web access
-  - **Parallel processing**: Uses multiprocessing to handle multiple jobs concurrently
-  - **Lock files**: Prevents concurrent processing of same job (`.slurm-<jobid>.lock`)
-  - **Dual tracking**: Uses both marker files (`.publish-done`) and state file for reliability
-  - Automatic cleanup of old directories
+**File**: `publish_slurm_logs.py`
 
-### Wrapper Script (for scrontab)
-- **File**: `run_slurm_publisher.sh`
-- **Purpose**: Wrapper for running via NERSC scrontab
-- **Features**:
-  - Lock file to prevent concurrent runs
-  - Logging with timestamps
-  - Error handling
+**Features:**
+- Dual processing modes (legacy split vs. new pre-split)
+- Checks if SLURM jobs are finished (not in queue, old enough)
+- Extracts PandaIDs and organizes files by PandaID
+- Copies pilotlog and additional files
+- Sets world-readable permissions for web access
+- Parallel processing with multiprocessing
+- Lock files prevent concurrent processing of same job
+- Dual tracking (marker files + state file) for reliability
+- Automatic cleanup of old directories
 
-## Directory Structure
+### Split Script (Legacy Mode Only)
+**File**: `split_slurm_output.py`
 
-### Input (Harvester Workdir)
+**Purpose:** Splits combined SLURM output into per-task/per-PandaID files
+
+**Used when:** `single_slurm_out_file: true`
+
+**Not used when:** `single_slurm_out_file: false` (files are already split by SLURM)
+
+### Wrapper Script
+**File**: `run_slurm_publisher.sh`
+
+**Purpose:** Wrapper for cron/scrontab automation
+
+**Features:**
+- Lock file prevents concurrent runs
+- Logging with timestamps
+- Error handling
+
+## Directory Structure Examples
+
+### Legacy Mode (single_slurm_out_file: true)
+
+**Input (Harvester workdir):**
 ```
-/pscratch/sd/x/xin/panda/workdir/panda/
-├── <panda queue name>/
-│   ├── 11270/                    # Worker directory
-│   │   ├── slurm-50685843.out    # Combined SLURM output
-│   │   ├── 50685843/0/           # Directory of task 0 of slurm job 50685843   
-│   │   ├── 50685843/1/           # Directory of task 1 of slurm job 50685843
-│   │   └── ...
-│   └── 11271/
-└── Other_Queue/
-```
-
-### Output (CFS/Web)
-```
-/global/cfs/cdirs/<nersc project name>/www/panda/jobs/
-├── <panda queue name>/                   # Queue name
-│   ├── 260789/                              # PandaID directory
-│   │   ├── slurm-50685843-task67-panda260789.out  # SLURM split output
-│   │   ├── slurm-50685843-header.out              # Header file
-│   │   ├── pilotlog.txt                           # Full pilot log
-│   │   └── PanDA_Pilot-260789/                    # For failed tasks only
-│   │       ├── payload.stdout
-│   │       ├── payload.stderr
-│   │       └── workDir/
-│   │           └── dataprod_rel*.csv
-│   ├── 260790/                              # Another PandaID
-│   │   ├── slurm-50685843-task68-panda260790.out
-│   │   ├── slurm-50685843-header.out
-│   │   └── pilotlog.txt
-│   └── 7111501056/                          # PandaID from multi-job pilot
-│       ├── slurm-51874506-task152-panda7111501056.out
-│       ├── slurm-51874506-header.out
-│       └── pilotlog.txt                     # Same pilotlog for all PandaIDs from task 152
-└── Other_Queue/
+workdir/
+└── <queue_name>/
+    └── 11270/                      # Worker directory
+        ├── slurm-50685843.out      # One big file with all task output
+        ├── 50685843/               # Job directory
+        │   ├── 0/                  # Task 0 directory
+        │   │   └── pilotlog.txt
+        │   ├── 1/                  # Task 1 directory
+        │   │   └── pilotlog.txt
+        │   └── ...
+        └── .publish-done-50685843  # Marker file (created after processing)
 ```
 
-**Note on multi-PandaID pilots**: When a single pilot (task) processes multiple PandaIDs:
-- Separate output files are created for each PandaID (e.g., `task152-panda7111501056.out`, `task152-panda7111438591.out`)
-- Each file contains the SAME content (full task output)
-- pilotlog.txt is copied to EACH PandaID directory (contains continuous log for all jobs)
-- This ensures users searching by PandaID have complete context
+**Output (Web directory):**
+```
+jobs/
+└── <queue_name>/
+    ├── 260789/                                           # PandaID directory
+    │   ├── slurm-50685843-task67-panda260789.out        # Split task output
+    │   ├── slurm-50685843-header.out                    # Header file
+    │   └── pilotlog.txt                                 # Pilot log
+    └── 260790/                                           # Another PandaID
+        ├── slurm-50685843-task68-panda260790.out
+        ├── slurm-50685843-header.out
+        └── pilotlog.txt
+```
+
+### New Mode (single_slurm_out_file: false)
+
+**Input (Harvester workdir):**
+```
+workdir/
+└── <queue_name>/
+    └── 11270/                        # Worker directory
+        ├── slurm-55525475.out        # Overall SLURM info only
+        ├── slurm55525475-task0.out   # Task 0 stdout
+        ├── slurm55525475-task0.err   # Task 0 stderr
+        ├── slurm55525475-task1.out   # Task 1 stdout
+        ├── slurm55525475-task1.err   # Task 1 stderr
+        ├── ...
+        ├── 55525475/                 # Job directory
+        │   ├── 0/                    # Task 0 directory
+        │   │   └── pilotlog.txt
+        │   ├── 1/                    # Task 1 directory
+        │   │   └── pilotlog.txt
+        │   └── ...
+        └── .publish-done-55525475    # Marker file
+```
+
+**Output (Web directory):**
+```
+jobs/
+└── <queue_name>/
+    ├── 1010560/                          # PandaID directory
+    │   ├── slurm-55525475.out            # Overall SLURM info
+    │   ├── slurm55525475-task10.out      # Task stdout
+    │   ├── slurm55525475-task10.err      # Task stderr (separate!)
+    │   └── pilotlog-task10.txt           # Pilot log
+    └── 1010561/                          # Another PandaID
+        ├── slurm-55525475.out
+        ├── slurm55525475-task11.out
+        ├── slurm55525475-task11.err
+        └── pilotlog-task11.txt
+```
+
+**Note:** In new mode, stderr is in a separate `.err` file for easier debugging.
 
 ## Installation
 
-### 1. Configure paths in config file
-Edit `publish_slurm_logs_config.json` and verify:
-- `paths.workdir_root` points to your harvester workdir
-- `paths.cfs_destination` points to your CFS www directory
-- `paths.split_script` points to split_slurm_output.py
+### 1. Choose Your SLURM Logging Mode
 
-### 2. Create CFS directories
+**For legacy mode (default):**
+- Use standard SLURM template (no special output flags)
+- Set `single_slurm_out_file: true` in config
+- Requires `split_script` path in config
+
+**For new mode (recommended for new deployments):**
+- Update SLURM template to include:
+  ```bash
+  --output=slurm%j-task%t.out --error=slurm%j-task%t.err
+  ```
+- Set `single_slurm_out_file: false` in config
+- No split script needed
+
+### 2. Configure Paths
+
+Edit `publish_slurm_logs_config.json`:
+```json
+{
+  "paths": {
+    "workdir_root": "/path/to/harvester/workdir",
+    "cfs_destination": "/path/to/web/directory/jobs",
+    "split_script": "/path/to/split_slurm_output.py",
+    "state_file": "/path/to/.slurm_publish_state.json",
+    "log_file": "/path/to/publish_slurm_logs.log"
+  },
+  "processing": {
+    "single_slurm_out_file": true
+  }
+}
+```
+
+### 3. Create Web Directories
 ```bash
-# Create www directory structure
-mkdir -p /global/cfs/cdirs/<nersc project name>/www/panda/jobs
+# Create directory structure
+mkdir -p /path/to/web/directory/panda/jobs
 
 # Set permissions for web access
-chmod 755 /global/cfs/cdirs/<nersc project name>/www
-chmod 755 /global/cfs/cdirs/<nersc project name>/www/panda
-chmod 755 /global/cfs/cdirs/<nersc project name>/www/panda/jobs
+chmod 755 /path/to/web/directory
+chmod 755 /path/to/web/directory/panda
+chmod 755 /path/to/web/directory/panda/jobs
 
-# Queue subdirectories will be created automatically by the publisher
+# Queue subdirectories created automatically
 ```
 
-### 3. Test with dry-run
+### 4. Test with Dry-Run
 ```bash
 python3 publish_slurm_logs.py --dry-run
+# Review log output to verify behavior
 ```
 
-### 4. Set up scrontab
-Edit your scrontab:
+### 5. Set Up Automation
+
+**Using cron:**
+```bash
+# Run every 10 minutes
+*/10 * * * * /path/to/run_slurm_publisher.sh
+```
+
+**Using scrontab (NERSC):**
 ```bash
 scrontab -e
-```
 
-For example:
-```bash
+# Add:
 #SCRON -C cron
 #SCRON -q workflow
-#SCRON -A <nersc project name>
+#SCRON -A <project>
 #SCRON -t 00:30:00
 #SCRON --time-min=00:05:00
 #SCRON --job-name=slurm-log-publisher
-#SCRON -o <path to directory where you install and run the publisher scripts>/scron-output-%j.out
+#SCRON -o /path/to/scron-output-%j.out
 #SCRON --open-mode=append
-*/10 * * * * <path to directory where you install and run the publisher scripts>/run_slurm_publisher.sh
+*/10 * * * * /path/to/run_slurm_publisher.sh
 ```
 
-This runs every 10 minutes. Adjust `*/10` to change frequency.
-
-### 5. Verify scrontab
+### 6. Verify
 ```bash
-scrontab -l
+# Check logs are published
+ls -la /path/to/web/directory/panda/jobs/
+
+# Verify cron/scrontab is running
+scrontab -l  # or: crontab -l
 ```
 
 ## Usage
@@ -205,39 +370,60 @@ python3 publish_slurm_logs.py --config /path/to/config.json
 
 ### Via Wrapper Script
 ```bash
-# Run via wrapper (same as scrontab)
+# Run via wrapper (same as cron/scrontab)
 ./run_slurm_publisher.sh
 ```
 
 ### Check Logs
 ```bash
 # View main log
-tail -f <path to directory where you install and run the publisher scripts>/publish_slurm_logs.log
+tail -f /path/to/publish_slurm_logs.log
 
-# View scrontab output
-tail -f <path to directory where you install and run the publisher scripts>/scron-output-*.out
+# View cron/scrontab output
+tail -f /path/to/scron-output-*.out
 ```
 
 ### Check State
 ```bash
 # View processed jobs state
-cat <path to directory where you install and run the publisher scripts>/.slurm_publish_state.json | jq
+cat /path/to/.slurm_publish_state.json | jq
 ```
 
-## Integration with PanDA 
+## Integration with PanDA
 
-In order to publish these slurm job logs on panda monitor, the following changes are needed:
+To publish SLURM logs on PanDA monitor:
 
-### 1. in SLURM job template used by a particular panda queue -- define the GTAG value pointing to the corresponding web directory, e.g. 
-```
-export GTAG="https://portal.nersc.gov/cfs/<nersc project name>/panda/jobs/<panda queue name>"
+### 1. Set GTAG in SLURM Template
+
+Define GTAG pointing to your web directory:
+
+**Legacy mode:**
+```bash
+export GTAG="https://your-web-portal/panda/jobs/<queue_name>"
 ...
-srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG ...
+srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG \
+     --label -n $HARVESTER_NTASKS \
+     /bin/bash ./wrapper.sh ...
 ```
 
-### 2. make sure in the pilot wrapper script, export it to container:
-```
-echo "export GTAG="$GTAG >> myEnv.sh
+**New mode:**
+```bash
+export GTAG="https://your-web-portal/panda/jobs/<queue_name>"
+...
+srun --export=HARVESTER_ID,HARVESTER_WORKER_ID,GTAG \
+     --output=slurm%j-task%t.out \
+     --error=slurm%j-task%t.err \
+     -n $HARVESTER_NTASKS \
+     /bin/bash ./wrapper.sh ...
 ```
 
-### 3. use pilot version 3.13.0.23 or later.
+### 2. Export GTAG to Container
+
+In pilot wrapper script:
+```bash
+echo "export GTAG=$GTAG" >> myEnv.sh
+```
+
+### 3. Use Compatible Pilot Version
+
+Requires pilot version 3.13.0.23 or later.

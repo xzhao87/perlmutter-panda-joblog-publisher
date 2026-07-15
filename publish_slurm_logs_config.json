@@ -25,14 +25,17 @@
     
     "processing": {
         "_comment": "Controls how SLURM jobs are processed and published.",
+        "single_slurm_out_file": true,
+        "_comment_single_slurm_out_file": "Whether one SLURM job puts all task stdout/stderr into one big .out file (true) or each task writes to separate files (false). When false, files are named slurm<jobid>-task<taskid>.out and slurm<jobid>-task<taskid>.err. Default: true (legacy mode).",
+        
         "split_script": "<pathname to the split_slurm_output.py script>",
-        "_comment_split_script": "Python script to split SLURM output by task/PandaID. Handles multiple PandaIDs per task.",
+        "_comment_split_script": "Python script to split SLURM output by task/PandaID. Only used when single_slurm_out_file is true. Handles multiple PandaIDs per task.",
         
         "max_concurrent_jobs": 10,
         "_comment_max_concurrent_jobs": "Maximum number of SLURM jobs to process in parallel. Lower for large files (3-5) to avoid I/O contention. Higher for small files (15-20) for faster processing. Implemented using Python multiprocessing.Pool.",
         
         "delete_original_splits": true,
-        "_comment_delete_original_splits": "Whether to delete split files (slurm-XXX-taskN-pandaXXX.out) from source after copying to CFS. Set false for debugging."
+        "_comment_delete_original_splits": "Whether to delete split files (slurm-XXX-taskN-pandaXXX.out) from source after copying to CFS. Set false for debugging. Only applies when single_slurm_out_file is true."
     },
     
     "filters": {
