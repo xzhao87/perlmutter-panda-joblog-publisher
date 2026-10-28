@@ -12,30 +12,48 @@
         
         "state_file": "<where do you want the .slurm_publish_state.json to be placed>",
         "_comment_state_file": "Global state file tracking processed jobs (old approach). Kept for migration compatibility and defense-in-depth.",
+
+        "state_db": "<pathname to a local sqlite DB, e.g. ./.slurm_publish_state.sqlite3>",
+        "_comment_state_db": "Workspace-local SQLite state. The legacy JSON file is imported once and then left unchanged.",
         
         "log_file": "<pathname of the publisher log file>",
-        "_comment_log_file": "Main log file for the publisher. Includes all INFO/WARNING/ERROR messages from main process and parallel workers."
+        "_comment_log_file": "Workspace-local publisher log. Dry-run logs only to stdout and does not create this file.",
+
+        "lock_file": "<pathname to lock file, e.g. ./.publisher.lock>",
+        "_comment_lock_file": "Workspace-local lock shared by publisher and retention cleanup."
     },
     
     "timing": {
         "_comment": "Time-related settings for cleanup and job age checking.",
-        "retention_days": 5,
+        "retention_days": 3,
         "_comment_retention_days": "Number of days to keep published PandaID directories in CFS. Older directories are automatically deleted based on mtime."
     },
     
     "processing": {
         "_comment": "Controls how SLURM jobs are processed and published.",
-        "single_slurm_out_file": true,
+        "single_slurm_out_file": false,
         "_comment_single_slurm_out_file": "Whether one SLURM job puts all task stdout/stderr into one big .out file (true) or each task writes to separate files (false). When false, files are named slurm<jobid>-task<taskid>.out and slurm<jobid>-task<taskid>.err. Default: true (legacy mode).",
         
         "split_script": "<pathname to the split_slurm_output.py script>",
         "_comment_split_script": "Python script to split SLURM output by task/PandaID. Only used when single_slurm_out_file is true. Handles multiple PandaIDs per task.",
         
-        "max_concurrent_jobs": 10,
+        "max_concurrent_jobs": 3,
         "_comment_max_concurrent_jobs": "Maximum number of SLURM jobs to process in parallel. Lower for large files (3-5) to avoid I/O contention. Higher for small files (15-20) for faster processing. Implemented using Python multiprocessing.Pool.",
         
         "delete_original_splits": true,
         "_comment_delete_original_splits": "Whether to delete split files (slurm-XXX-taskN-pandaXXX.out) from source after copying to CFS. Set false for debugging. Only applies when single_slurm_out_file is true."
+    },
+
+    "discovery": {
+        "max_worker_probes_per_cycle": 500,
+        "_comment_max_worker_probes_per_cycle": "Maximum newest worker directories considered per queue and publisher cycle."
+    },
+
+    "cleanup": {
+        "enabled_in_publisher": false,
+        "max_directories_per_run": 50000,
+        "legacy_scan_limit": 50000,
+        "_comment": "Retention is performed by cleanup_slurm_logs.py in a separate daily scron job."
     },
     
     "filters": {
@@ -67,6 +85,13 @@
             "files": "*",
             "_comment_files_recursive": "Use '*' to copy all files in directory. Directory structure is preserved at destination."
         }
-    ]
+    ],
     
+    "_comment_additional_notes": [
+        "Legacy JSON state and existing source marker files are imported/read as migration evidence; source markers are never created or changed.",
+        "Task 32: Failed task files (PanDA_Pilot-*) are only copied to the CORRECT PandaID directory, not duplicated across all PandaIDs from same task.",
+        "A workspace-local flock prevents overlapping publisher and cleanup processes.",
+        "SQLite is written only by the publisher parent process; /pscratch is read-only.",
+        "pilotlog.txt is copied to ALL PandaID directories from same task (contains continuous log across pilot lifetime)."
+    ]
 }

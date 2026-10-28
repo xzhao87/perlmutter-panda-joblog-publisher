@@ -8,7 +8,6 @@
 SCRIPT_DIR="<pathname to the directory where scripts like publish-slurm-logs.py can be found>"
 PUBLISHER_SCRIPT="${SCRIPT_DIR}/publish_slurm_logs.py"
 CONFIG_FILE="${SCRIPT_DIR}/publish_slurm_logs_config.json"
-LOCK_FILE="${SCRIPT_DIR}/.publisher.lock"
 
 # Function to log with timestamp
 log() {
@@ -70,23 +69,8 @@ if [ $? -ne 0 ]; then
 fi
 log "Using Python: $PYTHON ($($PYTHON --version 2>&1))"
 
-# Check if another instance is running
-if [ -f "$LOCK_FILE" ]; then
-    PID=$(cat "$LOCK_FILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        log "Another instance is running (PID: $PID), exiting"
-        exit 0
-    else
-        log "Stale lock file found, removing"
-        rm -f "$LOCK_FILE"
-    fi
-fi
-
-# Create lock file
-echo $$ > "$LOCK_FILE"
-
-# Ensure lock is removed on exit
-trap "rm -f '$LOCK_FILE'" EXIT INT TERM
+# publish_slurm_logs.py owns the workspace flock. Keeping lock ownership in
+# Python also protects direct invocations and coordinates with daily cleanup.
 
 # Log start
 log "Starting SLURM log publisher"

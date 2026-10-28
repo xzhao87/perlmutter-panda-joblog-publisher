@@ -2,8 +2,8 @@
 """
 Automated SLURM Log Publisher for PanDA
 
-This script scans for finished SLURM jobs, splits their output by task/PandaID,
-and publishes them to CFS for web access via NERSC Science Gateway.
+This script scans for finished SLURM jobs and publishes their pre-split task
+output to CFS for web access via NERSC Science Gateway.
 
 File structure in CFS:
   $CFS/www/panda/workers/<queue_name>/<panda_id>/slurm-<jobid>-task<taskid>-panda<pandaid>.out
@@ -15,30 +15,34 @@ Usage:
 
 Key Features:
   - Parallel processing of multiple SLURM jobs with configurable concurrency
-  - Lock files prevent concurrent processing of the same job
-  - Dual-defense tracking: marker files (.publish-done) + state file for reliability
-  - Migration compatible: checks both old and new tracking mechanisms
+  - Workspace-local SQLite state; /pscratch is always read-only
+  - One squeue query per publisher cycle
+  - Copy-once and CFS hard-link deduplication for shared content
+  - Existing JSON state and marker files are migration inputs only
   - Handles pilots that process multiple PandaIDs correctly
   - Copies failed task files (payload.stdout, etc.) based on configurable patterns
   - Extracts PandaID from PanDA_Pilot-<pandaid> to avoid duplicating failed files
   - Sets proper file permissions (0o644) for web accessibility
-  - Automatic cleanup of old logs after retention period
+  - Retention cleanup is handled by cleanup_slurm_logs.py
   - Copies header files and pilotlog.txt to each PandaID directory
 """
 
 import os
 import sys
+sys.dont_write_bytecode = True
 import json
 import re
 import shutil
 import subprocess
 import argparse
-import fcntl
 import multiprocessing
+import getpass
+import uuid
 from pathlib import Path
-from datetime import datetime, timedelta
-from collections import defaultdict
+from datetime import datetime
 import logging
+
+from slurm_publish_state import PublisherState, WorkspaceLock
 
 
 def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
@@ -53,43 +57,21 @@ def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
     class MinimalPublisher:
         def __init__(self, cfg):
             self.config = cfg
-            # Load state for tracking processed jobs
-            # Needed by _is_job_published method to check old state file for migration compatibility
-            self.state = self._load_state()
+            self.dry_run = dry_run
             # Setup minimal logging for this process
             log_file = cfg['paths']['log_file']
+            handlers = [logging.StreamHandler(sys.stdout)]
+            if not dry_run:
+                handlers.insert(0, logging.FileHandler(log_file))
             logging.basicConfig(
                 level=logging.INFO,
                 format=f'%(asctime)s [%(levelname)s] [PID:{os.getpid()}] %(message)s',
-                handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+                handlers=handlers,
+                force=True,
             )
             self.logger = logging.getLogger(f"{__name__}.worker.{job_id}")
         
-        def _load_state(self):
-            """
-            Load state tracking (which jobs have been processed).
-            
-            This method is needed by MinimalPublisher to support
-            the migration compatibility check in _is_job_published().
-            """
-            state_file = self.config['paths']['state_file']
-            if os.path.exists(state_file):
-                try:
-                    with open(state_file, 'r') as f:
-                        return json.load(f)
-                except Exception as e:
-                    # If state file is corrupted or unreadable, return empty state
-                    return {'processed_jobs': {}, 'last_run': None}
-            return {
-                'processed_jobs': {},  # {queue: {slurm_job_id: timestamp}}
-                'last_run': None
-            }
-        
         # Copy necessary methods from SlurmLogPublisher
-        _acquire_job_lock = SlurmLogPublisher._acquire_job_lock
-        _release_job_lock = SlurmLogPublisher._release_job_lock
-        _is_job_published = SlurmLogPublisher._is_job_published
-        _mark_job_published = SlurmLogPublisher._mark_job_published
         _split_slurm_output = SlurmLogPublisher._split_slurm_output
         _publish_files = SlurmLogPublisher._publish_files
         _process_single_job = SlurmLogPublisher._process_single_job
@@ -102,6 +84,8 @@ def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
         _find_presplit_task_files = SlurmLogPublisher._find_presplit_task_files
         _extract_panda_ids_from_file = SlurmLogPublisher._extract_panda_ids_from_file
         _publish_presplit_files = SlurmLogPublisher._publish_presplit_files
+        _copy_once_and_link = SlurmLogPublisher._copy_once_and_link
+        _destination_matches_source = SlurmLogPublisher._destination_matches_source
     
     publisher = MinimalPublisher(config)
     return publisher._process_single_job(queue_name, worker_dir, item, job_id, dry_run)
@@ -110,212 +94,119 @@ def _process_job_wrapper(config, queue_name, worker_dir, item, job_id, dry_run):
 class SlurmLogPublisher:
     """Manages automated publishing of SLURM logs to CFS"""
     
-    def __init__(self, config_path):
+    def __init__(self, config_path, dry_run=False):
         """Initialize with configuration file"""
         self.config = self._load_config(config_path)
-        self.state = self._load_state()
-        self._setup_logging()
+        self.dry_run = dry_run
+        self._setup_logging(dry_run=dry_run)
+        paths = self.config['paths']
+        legacy_state = paths.get('state_file')
+        self.state_db = PublisherState(
+            paths['state_db'], legacy_json_path=legacy_state, dry_run=dry_run
+        )
+        self.process_lock = WorkspaceLock(paths['lock_file'], enabled=not dry_run)
         
     def _load_config(self, config_path):
         """Load JSON configuration"""
         with open(config_path, 'r') as f:
             return json.load(f)
     
-    def _load_state(self):
-        """Load state tracking (which jobs have been processed)"""
-        state_file = self.config['paths']['state_file']
-        if os.path.exists(state_file):
-            with open(state_file, 'r') as f:
-                return json.load(f)
-        return {
-            'processed_jobs': {},  # {queue: {slurm_job_id: timestamp}}
-            'last_run': None
-        }
-    
-    def _save_state(self):
-        """Save state tracking"""
-        state_file = self.config['paths']['state_file']
-        os.makedirs(os.path.dirname(state_file), exist_ok=True)
-        with open(state_file, 'w') as f:
-            json.dump(self.state, f, indent=2)
-    
-    def _setup_logging(self):
+    def _setup_logging(self, dry_run=False):
         """Configure logging"""
         log_file = self.config['paths']['log_file']
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        
+        handlers = [logging.StreamHandler(sys.stdout)]
+        if not dry_run:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            handlers.insert(0, logging.FileHandler(log_file))
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler(sys.stdout)
-            ]
+            handlers=handlers,
+            force=True,
         )
         self.logger = logging.getLogger(__name__)
     
-    def _acquire_job_lock(self, worker_dir, job_id, timeout=5):
-        """
-        Acquire an exclusive lock for processing this SLURM job.
-        Uses flock to ensure only one process can parse this job at a time.
-        
-        Returns: (lock_acquired, lock_file_handle) or (False, None) on failure
-        """
-        lock_file = os.path.join(worker_dir, f'.slurm-{job_id}.lock')
-        
-        try:
-            lock_fd = open(lock_file, 'w')
-            # Try to acquire non-blocking exclusive lock
-            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Write PID for debugging
-            lock_fd.write(f"{os.getpid()}\n{datetime.now().isoformat()}\n")
-            lock_fd.flush()
-            return True, lock_fd
-        except (IOError, OSError) as e:
-            # Lock is held by another process
-            if lock_fd:
-                try:
-                    lock_fd.close()
-                except:
-                    pass
-            self.logger.debug(f"Could not acquire lock for job {job_id}: {e}")
-            return False, None
-    
-    def _release_job_lock(self, lock_fd):
-        """
-        Release job lock and delete lock file.
-        
-        After publishing is complete, the lock file is no longer needed since:
-        1. The .publish-done marker file provides permanent tracking
-        2. The state file also tracks processed jobs
-        3. Lock file is only for preventing concurrent processing during publish
-        
-        Cleaning up lock files prevents accumulation of stale lock files.
-        """
-        if lock_fd:
-            try:
-                # Get lock file path before closing (needed for deletion)
-                lock_file_path = lock_fd.name
-                
-                # Release flock and close file descriptor
-                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-                lock_fd.close()
-                
-                # Delete the lock file after releasing and closing
-                if os.path.exists(lock_file_path):
-                    os.unlink(lock_file_path)
-                    self.logger.debug(f"Cleaned up lock file: {lock_file_path}")
-            except Exception as e:
-                # Log but don't fail on lock cleanup errors
-                self.logger.warning(f"Could not clean up lock file: {e}")
-                pass
-    
-    def _is_job_published(self, worker_dir, job_id):
-        """
-        Check if job has already been published.
-        
-        Checks both:
-        1. Marker file (.publish-done) - newer tracking approach
-        2. State file - older approach (kept for migration compatibility)
-        
-        This dual check ensures old jobs published by the old system
-        (which only used .slurm_publish_state.json) are not republished after
-        upgrading to the new system.
-        
-        Returns: True if already published, False otherwise
-        """
-        # Check marker file (new approach)
-        marker_file = os.path.join(worker_dir, f'.slurm-{job_id}.publish-done')
-        if os.path.exists(marker_file):
-            return True
-        
-        # Check state file (old approach, for migration compatibility)
-        # Extract queue name from worker_dir path
-        # Path format: /path/to/workdir/panda/<queue_name>/<worker_id>
-        try:
-            queue_name = os.path.basename(os.path.dirname(worker_dir))
-            
-            if queue_name in self.state.get('processed_jobs', {}):
-                if job_id in self.state['processed_jobs'][queue_name]:
-                    # Job was published by old system - create marker for future
-                    self.logger.info(
-                        f"Job {job_id} found in state file (published by old system), "
-                        f"creating marker file for future tracking"
-                    )
-                    self._mark_job_published(worker_dir, job_id)
-                    return True
-        except Exception as e:
-            self.logger.warning(f"Could not check state file for job {job_id}: {e}")
-        
-        return False
-    
-    def _mark_job_published(self, worker_dir, job_id):
-        """
-        Mark job as published by creating .publish-done marker file.
-        """
-        marker_file = os.path.join(worker_dir, f'.slurm-{job_id}.publish-done')
-        try:
-            with open(marker_file, 'w') as f:
-                f.write(f"{datetime.now().isoformat()}\n")
-                f.write(f"pid={os.getpid()}\n")
-        except Exception as e:
-            self.logger.warning(f"Could not create publish marker for job {job_id}: {e}")
-    
-    def _is_job_finished(self, slurm_job_dir):
+    def _is_job_finished(self, slurm_job_dir, active_job_ids, squeue_ok=True):
         """
         Check if a SLURM job is finished.
-        Returns: (is_finished, job_id)
+        Returns: (is_finished, job_id). ``is_finished`` is None when the
+        worker directory disappeared and its stale DB row should be removed.
         
         A job is considered finished if:
         1. slurm-<jobid>.out file exists
         2. Job is not in squeue (RUNNING/PENDING)
         3. Job directory is older than min_job_age_seconds
         """
-        # Find main slurm output file (slurm-<jobid>.out without task/panda suffixes)
-        slurm_files = list(Path(slurm_job_dir).glob('slurm-*.out'))
-        if not slurm_files:
+        if not squeue_ok:
             return False, None
-        
-        # Find the main output file by looping through all matches
+
+        # One name-only directory pass avoids Path.glob() metadata calls.
         main_file = None
         job_id = None
-        for f in slurm_files:
-            match = re.search(r'slurm-(\d+)\.out$', f.name)
-            if match:
-                main_file = f
-                job_id = match.group(1)
-                break
-        
-        if not main_file or not job_id:
+        try:
+            with os.scandir(slurm_job_dir) as entries:
+                for entry in entries:
+                    match = re.fullmatch(r'slurm-(\d+)\.out', entry.name)
+                    if match:
+                        main_file = entry.path
+                        job_id = match.group(1)
+                        break
+                    if job_id is None:
+                        task_match = re.fullmatch(r'slurm(\d+)-task\d+\.out', entry.name)
+                        if task_match:
+                            job_id = task_match.group(1)
+        except FileNotFoundError:
+            self.logger.info(f"Worker directory no longer exists: {slurm_job_dir}")
+            return None, None
+        except OSError as exc:
+            self.logger.warning(f"Could not inspect worker directory {slurm_job_dir}: {exc}")
             return False, None
-        
+
+        # The pre-split layout still has the main output. Do not publish until
+        # it appears, since it is also one of the published artifacts.
         if not main_file or not job_id:
             return False, None
         
         # Check if job is old enough
         min_age = self.config['filters']['min_job_age_seconds']
-        file_age = datetime.now().timestamp() - main_file.stat().st_mtime
+        try:
+            file_age = datetime.now().timestamp() - os.stat(main_file).st_mtime
+        except FileNotFoundError:
+            self.logger.info(f"Worker directory disappeared while inspecting: {slurm_job_dir}")
+            return None, job_id
+        except OSError:
+            return False, job_id
         if file_age < min_age:
             self.logger.debug(f"Job {job_id} too recent ({file_age:.0f}s < {min_age}s)")
             return False, job_id
         
-        # Check if job is still running
-        try:
-            result = subprocess.run(
-                ['squeue', '-j', job_id, '-h'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                self.logger.debug(f"Job {job_id} still in queue")
-                return False, job_id
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
-            self.logger.warning(f"Could not check job status for {job_id}: {e}")
-            # Assume finished if squeue fails but file is old enough
-            pass
+        if job_id in active_job_ids:
+            self.logger.debug(f"Job {job_id} still in queue")
+            return False, job_id
         
         return True, job_id
+
+    def _get_active_slurm_jobs(self):
+        """Return (success, active_job_ids) using exactly one squeue call."""
+        user = getpass.getuser()
+        try:
+            result = subprocess.run(
+                ['squeue', '-h', '-u', user, '-o', '%A'],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.logger.error(f"Unable to query squeue once for this cycle: {exc}")
+            return False, set()
+        if result.returncode != 0:
+            self.logger.error(
+                f"squeue failed with exit code {result.returncode}: {result.stderr.strip()}"
+            )
+            return False, set()
+        active = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        self.logger.info(f"Single squeue query found {len(active)} active jobs")
+        return True, active
     
     def _split_slurm_output(self, slurm_file):
         """
@@ -626,6 +517,73 @@ class SlurmLogPublisher:
             self.logger.info(f"Copied {copied_count} additional files from failed task {task_dir}")
         
         return copied_count
+
+    def _destination_matches_source(self, src, dest):
+        """Cheap idempotency check for files previously copied with copy2()."""
+        try:
+            src_stat = os.stat(src, follow_symlinks=True)
+            dest_stat = os.stat(dest, follow_symlinks=True)
+            return (
+                src_stat.st_size == dest_stat.st_size
+                and src_stat.st_mtime_ns == dest_stat.st_mtime_ns
+            )
+        except OSError:
+            return False
+
+    def _copy_once_and_link(self, src, destinations, dry_run=False, label="file"):
+        """Copy a source to CFS once, then hard-link duplicate destinations.
+
+        All destinations must be on the CFS filesystem. If hard-link creation
+        is unavailable, the fallback copies the canonical CFS file and never
+        reopens the /pscratch source.
+        """
+        unique_destinations = list(dict.fromkeys(str(path) for path in destinations))
+        if not unique_destinations:
+            return 0
+
+        canonical = unique_destinations[0]
+        if dry_run:
+            self.logger.info(f"[DRY-RUN] Would copy canonical {label}: {src} -> {canonical}")
+            for dest in unique_destinations[1:]:
+                self.logger.info(
+                    f"[DRY-RUN] Would hard-link {label}: {canonical} -> {dest} "
+                    f"(CFS-copy fallback)"
+                )
+            return len(unique_destinations)
+
+        for dest in unique_destinations:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        if not self._destination_matches_source(src, canonical):
+            temp_path = f"{canonical}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            try:
+                shutil.copy2(src, temp_path)
+                os.chmod(temp_path, 0o644)
+                os.replace(temp_path, canonical)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        for dest in unique_destinations[1:]:
+            if self._destination_matches_source(src, dest):
+                continue
+            temp_path = f"{dest}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            try:
+                try:
+                    os.link(canonical, temp_path)
+                    self.logger.debug(f"Hard-linked CFS {label}: {canonical} -> {dest}")
+                except OSError as link_error:
+                    shutil.copy2(canonical, temp_path)
+                    self.logger.warning(
+                        f"CFS hard link failed for {dest}: {link_error}; used CFS copy"
+                    )
+                os.chmod(temp_path, 0o644)
+                os.replace(temp_path, dest)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        return len(unique_destinations)
     
     def _publish_files(self, split_files, queue_name, worker_dir, job_id, dry_run=False):
         """
@@ -829,7 +787,7 @@ class SlurmLogPublisher:
             job_id: SLURM job ID
             dry_run: if True, only log what would be done
         
-        Returns: number of files published
+        Returns: (number of files published, sorted list of PandaIDs)
         """
         cfs_root = self.config['paths']['cfs_destination']
         queue_dir = os.path.join(cfs_root, queue_name)
@@ -837,8 +795,9 @@ class SlurmLogPublisher:
         # Overall slurm job output file (contains generic SLURM info)
         slurm_main_out = os.path.join(worker_dir, f'slurm-{job_id}.out')
         
-        # Track unique PandaIDs and tasks
-        panda_id_to_tasks = {}  # {panda_id: [(task_id, out_file, err_file), ...]}
+        # Track each source task once. This prevents duplicate /pscratch reads
+        # when one pilot handled multiple PandaIDs.
+        task_records = []
         tasks_without_panda = []
         
         # Process each task file to extract PandaIDs
@@ -856,360 +815,351 @@ class SlurmLogPublisher:
                 tasks_without_panda.append(task_id)
                 continue
             
-            # Associate this task with all PandaIDs it processed
-            for panda_id in panda_ids:
-                if panda_id not in panda_id_to_tasks:
-                    panda_id_to_tasks[panda_id] = []
-                panda_id_to_tasks[panda_id].append((task_id, task_out_file, task_err_file))
+            task_records.append((task_id, task_out_file, task_err_file, panda_ids))
         
         # If NO tasks have PandaIDs, skip publishing
-        if not panda_id_to_tasks:
+        if not task_records:
             self.logger.warning(
                 f"No PandaIDs found in any task files "
                 f"({len(tasks_without_panda)} tasks without PandaID). "
                 f"Skipping publication for this job."
             )
-            return 0
+            return 0, []
         
         # Log partial task case
         if tasks_without_panda:
             self.logger.info(
-                f"Partial PandaID coverage: {len(panda_id_to_tasks)} unique PandaIDs, "
+                f"Partial PandaID coverage: {len(task_records)} tasks with PandaIDs, "
                 f"{len(tasks_without_panda)} tasks without PandaID. "
                 f"Publishing only tasks with PandaIDs."
             )
         
-        # Publish files for each PandaID
+        unique_panda_ids = sorted({
+            panda_id
+            for _, _, _, panda_ids in task_records
+            for panda_id in panda_ids
+        })
+
+        # Publish each distinct source once, then link duplicate CFS targets.
         published_count = 0
-        
-        for panda_id, tasks in panda_id_to_tasks.items():
-            panda_dir = os.path.join(queue_dir, panda_id)
-            
-            for task_id, task_out_file, task_err_file in tasks:
-                # 1. Copy task .out file
-                out_dest = os.path.join(panda_dir, f'slurm{job_id}-task{task_id}.out')
-                if dry_run:
-                    self.logger.info(f"[DRY-RUN] Would copy: {task_out_file} -> {out_dest}")
-                    published_count += 1
-                else:
-                    try:
-                        os.makedirs(panda_dir, exist_ok=True)
-                        shutil.copy2(task_out_file, out_dest)
-                        os.chmod(out_dest, 0o644)
-                        self.logger.debug(f"Published task stdout: {os.path.basename(out_dest)}")
-                        published_count += 1
-                    except Exception as e:
-                        self.logger.error(f"Failed to publish {task_out_file}: {e}")
-                
-                # 2. Copy task .err file (if exists)
-                if task_err_file and os.path.exists(task_err_file):
-                    err_dest = os.path.join(panda_dir, f'slurm{job_id}-task{task_id}.err')
-                    if dry_run:
-                        self.logger.info(f"[DRY-RUN] Would copy: {task_err_file} -> {err_dest}")
-                        published_count += 1
-                    else:
-                        try:
-                            shutil.copy2(task_err_file, err_dest)
-                            os.chmod(err_dest, 0o644)
-                            self.logger.debug(f"Published task stderr: {os.path.basename(err_dest)}")
-                            published_count += 1
-                        except Exception as e:
-                            self.logger.error(f"Failed to publish {task_err_file}: {e}")
-                
-                # 3. Copy pilotlog.txt
-                pilotlog_source = os.path.join(worker_dir, job_id, task_id, 'pilotlog.txt')
-                if os.path.exists(pilotlog_source):
-                    pilotlog_dest = os.path.join(panda_dir, f'pilotlog-task{task_id}.txt')
-                    if dry_run:
-                        self.logger.info(f"[DRY-RUN] Would copy: {pilotlog_source} -> {pilotlog_dest}")
-                        published_count += 1
-                    else:
-                        try:
-                            shutil.copy2(pilotlog_source, pilotlog_dest)
-                            os.chmod(pilotlog_dest, 0o644)
-                            self.logger.debug(f"Published pilotlog for task {task_id}")
-                            published_count += 1
-                        except Exception as e:
-                            self.logger.warning(f"Failed to copy pilotlog for task {task_id}: {e}")
-                
-                # 4. Copy additional files from failed tasks
-                task_dir = os.path.join(worker_dir, job_id, task_id)
-                failed_count = self._copy_additional_files_for_failed_task(
+
+        for task_id, task_out_file, task_err_file, panda_ids in task_records:
+            out_destinations = [
+                os.path.join(queue_dir, panda_id, f'slurm{job_id}-task{task_id}.out')
+                for panda_id in panda_ids
+            ]
+            published_count += self._copy_once_and_link(
+                task_out_file, out_destinations, dry_run=dry_run,
+                label=f"task {task_id} stdout",
+            )
+
+            if task_err_file and os.path.exists(task_err_file):
+                err_destinations = [
+                    os.path.join(queue_dir, panda_id, f'slurm{job_id}-task{task_id}.err')
+                    for panda_id in panda_ids
+                ]
+                published_count += self._copy_once_and_link(
+                    task_err_file, err_destinations, dry_run=dry_run,
+                    label=f"task {task_id} stderr",
+                )
+
+            pilotlog_source = os.path.join(worker_dir, job_id, task_id, 'pilotlog.txt')
+            if os.path.exists(pilotlog_source):
+                pilotlog_destinations = [
+                    os.path.join(queue_dir, panda_id, f'pilotlog-task{task_id}.txt')
+                    for panda_id in panda_ids
+                ]
+                published_count += self._copy_once_and_link(
+                    pilotlog_source, pilotlog_destinations, dry_run=dry_run,
+                    label=f"task {task_id} pilotlog",
+                )
+
+            task_dir = os.path.join(worker_dir, job_id, task_id)
+            for panda_id in panda_ids:
+                published_count += self._copy_additional_files_for_failed_task(
                     task_dir, panda_id, queue_dir, dry_run=dry_run
                 )
-                published_count += failed_count
-            
-            # 5. Copy overall slurm-<jobid>.out to each PandaID directory (once per PandaID)
-            if os.path.exists(slurm_main_out):
-                main_dest = os.path.join(panda_dir, f'slurm-{job_id}.out')
-                if dry_run:
-                    self.logger.info(f"[DRY-RUN] Would copy: {slurm_main_out} -> {main_dest}")
-                    published_count += 1
-                else:
-                    try:
-                        shutil.copy2(slurm_main_out, main_dest)
-                        os.chmod(main_dest, 0o644)
-                        self.logger.debug(f"Published main SLURM output to PandaID {panda_id}")
-                        published_count += 1
-                    except Exception as e:
-                        self.logger.error(f"Failed to publish main SLURM output to {panda_id}: {e}")
+
+        if os.path.exists(slurm_main_out):
+            main_destinations = [
+                os.path.join(queue_dir, panda_id, f'slurm-{job_id}.out')
+                for panda_id in unique_panda_ids
+            ]
+            published_count += self._copy_once_and_link(
+                slurm_main_out, main_destinations, dry_run=dry_run,
+                label="main SLURM output",
+            )
         
         self.logger.info(
             f"Published {published_count} files to {queue_dir} "
-            f"({len(panda_id_to_tasks)} unique PandaIDs)"
+            f"({len(unique_panda_ids)} unique PandaIDs)"
         )
-        return published_count
-    
-    def _cleanup_old_directories(self, dry_run=False):
-        """Remove PandaID directories older than retention_days within each queue"""
-        cfs_root = self.config['paths']['cfs_destination']
-        retention_days = self.config['timing']['retention_days']
-        cutoff_time = (datetime.now() - timedelta(days=retention_days)).timestamp()
-        
-        if not os.path.exists(cfs_root):
-            return
-        
-        removed_count = 0
-        
-        # Iterate through queue directories
-        for queue_name in os.listdir(cfs_root):
-            queue_path = os.path.join(cfs_root, queue_name)
-            if not os.path.isdir(queue_path):
-                continue
-            
-            # Within each queue, look for PandaID directories
-            for panda_dir_name in os.listdir(queue_path):
-                panda_dir_path = os.path.join(queue_path, panda_dir_name)
-                if not os.path.isdir(panda_dir_path):
-                    continue
-                
-                # Skip header files and non-numeric directories
-                if not panda_dir_name.isdigit():
-                    continue
-                
-                # Check directory mtime (last modification time)
-                try:
-                    dir_mtime = os.path.getmtime(panda_dir_path)
-                    if dir_mtime < cutoff_time:
-                        if dry_run:
-                            self.logger.info(f"[DRY-RUN] Would remove old directory: {panda_dir_path}")
-                        else:
-                            shutil.rmtree(panda_dir_path)
-                            self.logger.info(f"Removed old directory: {queue_name}/{panda_dir_name}")
-                            removed_count += 1
-                except OSError as e:
-                    self.logger.warning(f"Could not check/remove {panda_dir_path}: {e}")
-                    continue
-        
-        if removed_count > 0:
-            self.logger.info(f"Cleaned up {removed_count} old directories")
+        return published_count, unique_panda_ids
     
     def _process_single_job(self, queue_name, worker_dir, item, job_id, dry_run=False):
         """
         Process a single SLURM job: split output and publish to CFS.
         This method is designed to be called by multiple processes in parallel.
         
-        Returns: (success, published_count)
+        Returns: (success, published_count, panda_ids)
         """
-        # Check if already published using marker file
-        if self._is_job_published(worker_dir, job_id):
-            self.logger.debug(f"Job {job_id} already published (marker file exists)")
-            return True, 0
-        
-        # Try to acquire lock
-        lock_acquired, lock_fd = self._acquire_job_lock(worker_dir, job_id)
-        if not lock_acquired:
-            self.logger.debug(f"Could not acquire lock for job {job_id}, skipping (another process may be handling it)")
-            return False, 0
-        
-        try:
-            self.logger.info(f"Processing queue={queue_name} worker={item} job={job_id}")
-            
-            # Check processing mode
-            single_slurm_out_file = self.config['processing'].get('single_slurm_out_file', True)
-            
-            if single_slurm_out_file:
-                # Legacy mode: one big slurm-<jobid>.out file containing all tasks
-                # Need to split it first
-                slurm_file = os.path.join(worker_dir, f'slurm-{job_id}.out')
-                if not os.path.exists(slurm_file):
-                    self.logger.warning(f"SLURM output not found: {slurm_file}")
-                    return False, 0
-                
-                # Split output
-                split_files = self._split_slurm_output(slurm_file)
-                if not split_files:
-                    self.logger.warning(f"No split files created for job {job_id}")
-                    return False, 0
-                
-                # Publish to CFS (only publishes files with PandaIDs)
-                pub_count = self._publish_files(split_files, queue_name, worker_dir, job_id, dry_run=dry_run)
-                
-                # Clean up split files if configured (regardless of publish count)
-                if not dry_run and self.config['processing']['delete_original_splits']:
-                    for f in split_files:
-                        try:
-                            os.remove(f)
-                        except Exception as e:
-                            self.logger.warning(f"Could not remove {f}: {e}")
-            
-            else:
-                # New mode: each task writes to separate .out and .err files
-                # Files are already split: slurm<jobid>-task<taskid>.out and .err
-                task_files = self._find_presplit_task_files(worker_dir, job_id)
-                if not task_files:
-                    self.logger.warning(f"No task files found for job {job_id}")
-                    return False, 0
-                
-                # Publish pre-split files to CFS
-                pub_count = self._publish_presplit_files(task_files, queue_name, worker_dir, job_id, dry_run=dry_run)
-            
-            if pub_count == 0:
-                self.logger.info(
-                    f"Job {job_id}: No files published (no PandaIDs found). "
-                    f"Marking as processed to avoid reprocessing."
+        # The parent process handles SQLite state and the workspace lock.
+        # Worker processes never write state or lock files under /pscratch.
+        self.logger.info(f"Processing queue={queue_name} worker={item} job={job_id}")
+        single_slurm_out_file = self.config['processing'].get('single_slurm_out_file', True)
+
+        if single_slurm_out_file:
+            # Legacy mode is preserved, but a legacy dry-run is refused because
+            # the existing splitter writes output beside the source file.
+            if dry_run:
+                self.logger.error(
+                    "Legacy-mode dry-run is disabled because the legacy splitter "
+                    "is not guaranteed to be read-only"
                 )
-            
-            # Mark as published using both mechanisms for reliability:
-            # 1. Marker file (new approach)
-            # 2. State file (old approach, kept for defense in depth)
-            if not dry_run:
-                self._mark_job_published(worker_dir, job_id)
-            
-            return True, pub_count
-            
-        finally:
-            # Always release lock
-            self._release_job_lock(lock_fd)
+                return False, 0, []
+            slurm_file = os.path.join(worker_dir, f'slurm-{job_id}.out')
+            if not os.path.exists(slurm_file):
+                self.logger.warning(f"SLURM output not found: {slurm_file}")
+                return False, 0, []
+            split_files = self._split_slurm_output(slurm_file)
+            if not split_files:
+                self.logger.warning(f"No split files created for job {job_id}")
+                return False, 0, []
+            pub_count = self._publish_files(
+                split_files, queue_name, worker_dir, job_id, dry_run=dry_run
+            )
+            panda_ids = sorted({
+                self._extract_panda_id(os.path.basename(path))
+                for path in split_files
+                if self._extract_panda_id(os.path.basename(path))
+            })
+            if self.config['processing']['delete_original_splits']:
+                for path in split_files:
+                    try:
+                        os.remove(path)
+                    except Exception as exc:
+                        self.logger.warning(f"Could not remove {path}: {exc}")
+        else:
+            task_files = self._find_presplit_task_files(worker_dir, job_id)
+            if not task_files:
+                self.logger.warning(f"No task files found for job {job_id}")
+                return False, 0, []
+            pub_count, panda_ids = self._publish_presplit_files(
+                task_files, queue_name, worker_dir, job_id, dry_run=dry_run
+            )
+
+        if pub_count == 0:
+            self.logger.info(
+                f"Job {job_id}: No files published (no PandaIDs found). "
+                f"Marking as processed to avoid reprocessing."
+            )
+        return True, pub_count, panda_ids
     
-    def _process_queue(self, queue_name, dry_run=False):
-        """
-        Process all finished jobs for a queue.
-        
-        Implements parallel processing with max_concurrent_jobs limit.
-        Each job is processed in a separate call to _process_single_job, with
-        lock files preventing concurrent processing of the same job.
-        """
+    def _collect_queue_jobs(self, queue_name, active_job_ids, squeue_ok,
+                            worker_filters=None):
+        """Collect eligible jobs without running per-worker Slurm commands."""
         workdir_root = self.config['paths']['workdir_root']
         queue_dir = os.path.join(workdir_root, queue_name)
-        
         if not os.path.exists(queue_dir):
             self.logger.warning(f"Queue directory not found: {queue_dir}")
-            return 0
-        
-        # Collect all finished jobs that need processing
+            return []
+
         jobs_to_process = []
-        
-        # Scan for worker directories (numeric subdirs)
-        for item in os.listdir(queue_dir):
+        discovery_high_water = self.state_db.highest_worker_id(queue_name)
+        if worker_filters:
+            items = sorted(set(str(item) for item in worker_filters), key=int, reverse=True)
+        else:
+            with os.scandir(queue_dir) as entries:
+                available_worker_ids = {
+                    entry.name for entry in entries if entry.name.isdigit()
+                }
+
+            # Reuse the queue directory's existing name-only scan to reconcile
+            # stale failed/pending/processing rows. This adds no per-worker
+            # /pscratch metadata operations.
+            for missing_id in (
+                set(self.state_db.unpublished_worker_ids(queue_name))
+                - available_worker_ids
+            ):
+                if self.state_db.forget_missing_worker(queue_name, missing_id):
+                    self.logger.info(
+                        f"Stopped tracking missing worker queue={queue_name} "
+                        f"worker={missing_id}"
+                    )
+
+            items = sorted(available_worker_ids, key=int, reverse=True)
+            probe_limit = self.config.get('discovery', {}).get(
+                'max_worker_probes_per_cycle', 500
+            )
+            items = items[:probe_limit]
+
+        for item in items:
+            worker_status = self.state_db.worker_status(queue_name, item)
+            if worker_status == 'published':
+                continue
+            if (
+                not worker_filters
+                and discovery_high_water is not None
+                and int(item) <= discovery_high_water
+                and worker_status is None
+            ):
+                # Detailed rows may have been purged by retention. The compact
+                # queue high-water mark prevents those workers being republished.
+                continue
             worker_dir = os.path.join(queue_dir, item)
             if not os.path.isdir(worker_dir):
-                continue
-            
-            # Check if job is finished
-            is_finished, job_id = self._is_job_finished(worker_dir)
-            if not is_finished:
-                continue
-            
-            # Skip if already published (check marker file)
-            if self._is_job_published(worker_dir, job_id):
-                self.logger.debug(f"Skipping already published job: {job_id}")
-                continue
-            
-            jobs_to_process.append((worker_dir, item, job_id))
-        
-        if not jobs_to_process:
-            self.logger.debug(f"No new jobs to process for queue {queue_name}")
-            return 0
-        
-        self.logger.info(f"Found {len(jobs_to_process)} new jobs to process for queue {queue_name}")
-        
-        # Get state for this queue (keep old state tracking for defense in depth)
-        if queue_name not in self.state['processed_jobs']:
-            self.state['processed_jobs'][queue_name] = {}
-        processed_state = self.state['processed_jobs'][queue_name]
-        
-        # Process jobs with parallelism, respecting max_concurrent_jobs
-        max_concurrent = self.config['processing'].get('max_concurrent_jobs', 5)
-        processed_count = 0
-        
-        # Process jobs in batches
-        for i in range(0, len(jobs_to_process), max_concurrent):
-            batch = jobs_to_process[i:i+max_concurrent]
-            self.logger.info(
-                f"Processing batch {i//max_concurrent + 1}: "
-                f"{len(batch)} jobs (max_concurrent={max_concurrent})"
-            )
-            
-            # Use multiprocessing Pool for parallel processing
-            with multiprocessing.Pool(processes=len(batch)) as pool:
-                # Create tasks for each job in batch
-                tasks = []
-                for worker_dir, item, job_id in batch:
-                    task = pool.apply_async(
-                        _process_job_wrapper,
-                        args=(self.config, queue_name, worker_dir, item, job_id, dry_run)
+                if self.state_db.forget_missing_worker(queue_name, item):
+                    self.logger.info(
+                        f"Stopped tracking missing worker queue={queue_name} worker={item}"
                     )
-                    tasks.append((job_id, task))
-                
-                # Wait for all tasks to complete
-                for job_id, task in tasks:
-                    try:
-                        success, pub_count = task.get(timeout=3600)  # 1 hour timeout per job
-                        if success:
-                            processed_count += 1
-                            self.logger.info(f"Job {job_id} completed: {pub_count} files published")
-                            # Also update old state file for defense in depth
-                            if not dry_run:
-                                processed_state[job_id] = datetime.now().isoformat()
-                    except multiprocessing.TimeoutError:
-                        self.logger.error(f"Job {job_id} processing timed out after 1 hour")
-                    except Exception as e:
-                        self.logger.error(f"Job {job_id} processing failed: {e}")
-        
-        # Save state after processing batch
-        if not dry_run and processed_count > 0:
-            self._save_state()
-        
-        return processed_count
+                continue
+            is_finished, job_id = self._is_job_finished(
+                worker_dir, active_job_ids, squeue_ok=squeue_ok
+            )
+            if is_finished is None:
+                if self.state_db.forget_missing_worker(queue_name, item):
+                    self.logger.info(
+                        f"Stopped tracking missing worker queue={queue_name} worker={item}"
+                    )
+                continue
+            if job_id:
+                if self.state_db.job_is_published(queue_name, job_id):
+                    self.state_db.record_worker(
+                        queue_name, item, job_id, status='published'
+                    )
+                    continue
+                marker = os.path.join(worker_dir, f'.slurm-{job_id}.publish-done')
+                if os.path.exists(marker):
+                    self.state_db.mark_published(
+                        queue_name, item, job_id, [],
+                        self.config['paths']['cfs_destination'],
+                    )
+                    continue
+            if not is_finished:
+                self.state_db.record_worker(
+                    queue_name, item, job_id, status='pending'
+                )
+                continue
+            self.state_db.record_worker(queue_name, item, job_id, status='pending')
+            jobs_to_process.append((queue_name, worker_dir, item, job_id))
+
+        self.logger.info(
+            f"Found {len(jobs_to_process)} new jobs to process for queue {queue_name}"
+        )
+        return jobs_to_process
     
-    def run(self, dry_run=False):
+    def run(self, dry_run=False, queue_filters=None, worker_filters=None,
+            offline_dry_run=False):
         """Main execution loop"""
         self.logger.info("=" * 60)
         self.logger.info("Starting SLURM log publisher")
         if dry_run:
             self.logger.info("DRY RUN MODE - No changes will be made")
         
-        workdir_root = self.config['paths']['workdir_root']
-        
-        # Find all queues
-        if not os.path.exists(workdir_root):
-            self.logger.error(f"Workdir root not found: {workdir_root}")
-            return 1
-        
-        queues = [d for d in os.listdir(workdir_root) 
-                  if os.path.isdir(os.path.join(workdir_root, d))
-                  and d not in self.config['filters']['ignore_queues']]
-        
-        self.logger.info(f"Found {len(queues)} queues: {', '.join(queues)}")
-        
-        total_processed = 0
-        for queue in queues:
-            count = self._process_queue(queue, dry_run=dry_run)
-            total_processed += count
-        
-        # Cleanup old directories
-        self._cleanup_old_directories(dry_run=dry_run)
-        
-        # Update last run time
-        if not dry_run:
-            self.state['last_run'] = datetime.now().isoformat()
-            self._save_state()
-        
-        self.logger.info(f"Finished. Processed {total_processed} new jobs")
-        self.logger.info("=" * 60)
-        
-        return 0
+        if worker_filters and (not queue_filters or len(queue_filters) != 1):
+            self.logger.error("--worker requires exactly one --queue")
+            return 2
+
+        if not self.process_lock.acquire():
+            self.logger.warning("Another publisher or cleanup process holds the workspace lock")
+            return 0
+
+        try:
+            workdir_root = self.config['paths']['workdir_root']
+            if not os.path.exists(workdir_root):
+                self.logger.error(f"Workdir root not found: {workdir_root}")
+                return 1
+
+            ignored = set(self.config['filters'].get('ignore_queues', []))
+            if queue_filters:
+                queues = [queue for queue in queue_filters if queue not in ignored]
+            else:
+                with os.scandir(workdir_root) as entries:
+                    queues = sorted(
+                        entry.name for entry in entries
+                        if entry.name not in ignored and entry.is_dir(follow_symlinks=False)
+                    )
+            self.logger.info(f"Found {len(queues)} queues: {', '.join(queues)}")
+
+            if offline_dry_run:
+                if not dry_run:
+                    self.logger.error("--offline-dry-run requires --dry-run")
+                    return 2
+                self.logger.warning(
+                    "OFFLINE DRY RUN: skipping squeue and treating selected jobs as inactive"
+                )
+                squeue_ok, active_job_ids = True, set()
+            else:
+                squeue_ok, active_job_ids = self._get_active_slurm_jobs()
+            jobs_to_process = []
+            for queue_name in queues:
+                jobs_to_process.extend(self._collect_queue_jobs(
+                    queue_name,
+                    active_job_ids,
+                    squeue_ok,
+                    worker_filters=worker_filters if len(queues) == 1 else None,
+                ))
+
+            if not jobs_to_process:
+                self.logger.info("Finished. Processed 0 new jobs")
+                return 0
+
+            max_concurrent = int(
+                self.config['processing'].get('max_concurrent_jobs', 3)
+            )
+            max_concurrent = max(1, min(max_concurrent, len(jobs_to_process)))
+            self.logger.info(
+                f"Processing {len(jobs_to_process)} jobs with one pool of "
+                f"{max_concurrent} processes"
+            )
+
+            tasks = []
+            with multiprocessing.Pool(processes=max_concurrent) as pool:
+                for queue_name, worker_dir, worker_id, job_id in jobs_to_process:
+                    self.state_db.mark_processing(queue_name, worker_id, job_id)
+                    result = pool.apply_async(
+                        _process_job_wrapper,
+                        args=(self.config, queue_name, worker_dir, worker_id,
+                              job_id, dry_run),
+                    )
+                    tasks.append((queue_name, worker_id, job_id, result))
+
+                processed_count = 0
+                for queue_name, worker_id, job_id, result in tasks:
+                    try:
+                        success, pub_count, panda_ids = result.get(timeout=3600)
+                        if not success:
+                            self.state_db.mark_failed(
+                                queue_name, worker_id, job_id, "worker returned failure"
+                            )
+                            continue
+                        self.state_db.mark_published(
+                            queue_name, worker_id, job_id, panda_ids,
+                            self.config['paths']['cfs_destination'],
+                        )
+                        processed_count += 1
+                        self.logger.info(
+                            f"Job {job_id} completed: {pub_count} files published, "
+                            f"{len(panda_ids)} PandaIDs"
+                        )
+                    except multiprocessing.TimeoutError:
+                        self.state_db.mark_failed(
+                            queue_name, worker_id, job_id,
+                            "processing timed out after 1 hour",
+                        )
+                        self.logger.error(f"Job {job_id} processing timed out after 1 hour")
+                    except Exception as exc:
+                        self.state_db.mark_failed(
+                            queue_name, worker_id, job_id, str(exc)
+                        )
+                        self.logger.error(f"Job {job_id} processing failed: {exc}")
+
+            self.logger.info(f"Finished. Processed {processed_count} new jobs")
+            self.logger.info("=" * 60)
+            return 0
+        finally:
+            self.process_lock.release()
+            self.state_db.close()
 
 
 def main():
@@ -1218,7 +1168,7 @@ def main():
     )
     parser.add_argument(
         '--config',
-        default='/global/homes/x/xin/ws-panda/slurm-jobs/publish_slurm_logs_config.json',
+        default='<path to publish_slurm_logs_config.json file>',
         help='Path to configuration file'
     )
     parser.add_argument(
@@ -1226,12 +1176,34 @@ def main():
         action='store_true',
         help='Show what would be done without making changes'
     )
+    parser.add_argument(
+        '--queue',
+        action='append',
+        dest='queues',
+        help='Only inspect this queue (repeatable)'
+    )
+    parser.add_argument(
+        '--worker',
+        action='append',
+        dest='workers',
+        help='Only inspect this numeric worker ID (repeatable; requires one --queue)'
+    )
+    parser.add_argument(
+        '--offline-dry-run',
+        action='store_true',
+        help='Dry-run only: bypass squeue when Slurm authentication is unavailable'
+    )
     
     args = parser.parse_args()
     
     try:
-        publisher = SlurmLogPublisher(args.config)
-        return publisher.run(dry_run=args.dry_run)
+        publisher = SlurmLogPublisher(args.config, dry_run=args.dry_run)
+        return publisher.run(
+            dry_run=args.dry_run,
+            queue_filters=args.queues,
+            worker_filters=args.workers,
+            offline_dry_run=args.offline_dry_run,
+        )
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         return 130
